@@ -10418,232 +10418,292 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     }
 
     /* ════════════════════════════════════════════════════════════════════════════
-       DERIV OAUTH 2.0 INTEGRATION  ── UPDATED FOR ALPHANUMERIC APP ID
+       DERIV OAUTH 2.0 + PKCE  (modern flow — matches developers.deriv.com)
        ────────────────────────────────────────────────────────────────────────
        Flow:
-         1.  User clicks "Login with Deriv OAuth"
-         2.  We redirect to Deriv's OAuth endpoint with our Alphanumeric App ID
-             (e.g. 34l8UBN1Da3Qe5BQMlBpX — registered at developers.deriv.com)
-         3.  Deriv authenticates the user and redirects back to this page with
-             the token(s) in the URL hash:
-             #token1=<token>&loginid1=<loginid>&...
-         4.  derivOAuthHandleCallback() fires on load, reads the hash,
-             picks the right token, populates the form, and connects.
-       ────────────────────────────────────────────────────────────────────────
-       The Deriv OAuth URL format (current v3 API):
-         https://oauth.deriv.com/oauth2/authorize
-             ?app_id=<YOUR_ALPHANUMERIC_APP_ID>   (e.g. 34l8UBN1Da3Qe5BQMlBpX)
-             &l=EN
-             &brand=deriv
-             &redirect_uri=<this_page_url>
-    ═══════════════════════════════════════════════════════════════════════════ */
-    var DERIV_OAUTH_BASE = 'https://oauth.deriv.com/oauth2/authorize';
+         1. User clicks "Login with Deriv OAuth"
+         2. Generate PKCE (code_verifier + code_challenge) + state
+         3. Redirect to https://auth.deriv.com/oauth2/auth?...
+         4. Deriv redirects back to REGISTERED_REDIRECT_URI?code=...&state=...
+         5. Verify state, POST code + code_verifier to /oauth2/token
+         6. Use the resulting access_token exactly like a PAT:
+            savePAT → bootApp → connect() → connectWithFreshOTP()
+       ═══════════════════════════════════════════════════════════════════════════ */
 
-    function derivOAuthLogin() {
+    var DERIV_OAUTH_AUTH  = 'https://auth.deriv.com/oauth2/auth';
+    var DERIV_OAUTH_TOKEN = 'https://auth.deriv.com/oauth2/token';
+
+    /* Must exactly match the Redirect URL registered for this App ID
+       at developers.deriv.com (no trailing slash unless you registered one). */
+    var REGISTERED_REDIRECT_URI = 'https://unfield.site';
+
+    /* ── PKCE helpers ─────────────────────────────────────────────────────────── */
+    function _oauthBase64Url(buffer) {
+        var bytes = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer;
+        var str = '';
+        for (var i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+        return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function oauthGenerateCodeVerifier() {
+        var arr = new Uint8Array(32);
+        crypto.getRandomValues(arr);
+        return _oauthBase64Url(arr);
+    }
+
+    function oauthGenerateCodeChallenge(verifier) {
+        var data = new TextEncoder().encode(verifier);
+        return crypto.subtle.digest('SHA-256', data).then(function(digest) {
+            return _oauthBase64Url(digest);
+        });
+    }
+
+    function oauthRandomState() {
+        if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        var arr = new Uint8Array(16);
+        crypto.getRandomValues(arr);
+        return _oauthBase64Url(arr);
+    }
+
+    /* ── Start OAuth login (button handler — onclick="derivOAuthLogin()") ───── */
+    async function derivOAuthLogin() {
         var msgEl = document.getElementById('au-msg');
         var errEl = document.getElementById('au-err');
+        if (errEl) { errEl.innerHTML = ''; errEl.textContent = ''; }
 
-        errEl.innerHTML = '';
-        errEl.textContent = '';
-
-        /* FIXED: App ID Validation Enforcement — validateAppId() runs (via the
-           centralized getCurrentAppId()/requireValidAppId() pair) before the OAuth
-           redirect is ever built. On failure, the error is shown in #au-err with
-           the standard "Invalid Alphanumeric App ID. Example: 34l8UBN1Da3Qe5BQMlBpX"
-           wording and the flow stops here — no redirect happens. */
         var appId = requireValidAppId();
         if (!appId) return;
 
-        // Save App ID (string) so it survives the redirect
-        try { sessionStorage.setItem('deriv_oauth_appid', appId); } catch(e) {}
+        try {
+            var codeVerifier = oauthGenerateCodeVerifier();
+            var codeChallenge = await oauthGenerateCodeChallenge(codeVerifier);
+            var state = oauthRandomState();
 
-        /* CONFIGURED CALLBACK: registered redirect URI for App ID 34l8UBN1Da3Qe5BQMlBpX.
-           Must exactly match the Redirect URL registered at developers.deriv.com:
-           https://unfield.site
-           (trailing slash variants are rejected by Deriv — keep this exact). */
-        var REGISTERED_REDIRECT_URI = 'https://unfield.site';
-        var redirectUri = encodeURIComponent(REGISTERED_REDIRECT_URI);
-        var oauthUrl = DERIV_OAUTH_BASE +
-            '?app_id=' + encodeURIComponent(appId) + /* UPDATED FOR ALPHANUMERIC APP ID: appId stays a string, encodeURIComponent handles alphanumeric/_/- safely */
-            '&l=EN&brand=deriv' +
-            '&redirect_uri=' + redirectUri;
+            // Survive the full-page redirect
+            try {
+                sessionStorage.setItem('deriv_oauth_appid', appId);
+                sessionStorage.setItem('deriv_oauth_verifier', codeVerifier);
+                sessionStorage.setItem('deriv_oauth_state', state);
+            } catch (e) {}
 
-        if (msgEl) msgEl.textContent = 'Redirecting to Deriv for secure login with your Alphanumeric App ID…';
-        window.location.href = oauthUrl;
+            var params = new URLSearchParams({
+                response_type:         'code',
+                client_id:             appId,
+                redirect_uri:          REGISTERED_REDIRECT_URI,
+                scope:                 'trade account_manage',
+                state:                 state,
+                code_challenge:        codeChallenge,
+                code_challenge_method: 'S256'
+            });
+
+            if (msgEl) msgEl.textContent = 'Redirecting to Deriv for secure login…';
+            window.location.href = DERIV_OAUTH_AUTH + '?' + params.toString();
+        } catch (e) {
+            showAuthError('OAuth Setup Failed',
+                (e && e.message) || 'Could not prepare the secure login request. Use a modern browser with Web Crypto.',
+                'network');
+        }
     }
 
-    /* ── Parse OAuth tokens from URL hash / query string after redirect ──────
-       Deriv returns params in TWO possible formats depending on OAuth version:
-         Hash  :  #token1=xxx&loginid1=CR12345&token2=yyy&loginid2=VRTC999&acct1=...
-         Query :  ?token1=xxx&loginid1=CR12345&...
-       We parse both, build an account list, and prefer the first real account.
-    ────────────────────────────────────────────────────────────────────────── */
+    /* ── Parse callback query (new format: ?code=&state= or ?error=) ───────── */
     function derivOAuthParseCallback() {
-        var raw = window.location.hash.replace(/^#/, '') ||
-                  window.location.search.replace(/^\?/, '');
+        var raw = (window.location.search || '').replace(/^\?/, '');
         if (!raw) return null;
 
         var params = {};
         raw.split('&').forEach(function(pair) {
             var kv = pair.split('=');
             if (kv.length >= 2) {
-                params[decodeURIComponent(kv[0])] = decodeURIComponent(kv.slice(1).join('='));
+                params[decodeURIComponent(kv[0])] =
+                    decodeURIComponent(kv.slice(1).join('='));
             }
         });
 
-        // Collect numbered token/loginid pairs (token1, token2, …)
-        var accounts = [];
-        var i = 1;
-        while (params['token' + i] && params['loginid' + i]) {
-            accounts.push({
-                token:   params['token' + i],
-                loginid: params['loginid' + i],
-                currency: params['cur' + i] || params['currency' + i] || '',
-                isVirtual: /^VRT/i.test(params['loginid' + i])
-            });
-            i++;
+        // Error from Deriv (user cancelled, access denied, etc.)
+        if (params.error) {
+            return {
+                error: params.error,
+                error_description: params.error_description || params.error
+            };
         }
 
-        if (!accounts.length) {
-            // Fallback: single un-numbered token
-            if (params['token'] || params['access_token']) {
-                accounts.push({
-                    token:   params['token'] || params['access_token'],
-                    loginid: params['loginid'] || 'Unknown',
-                    currency: params['currency'] || '',
-                    isVirtual: false
-                });
-            }
+        // Success: authorization code + state
+        if (params.code && params.state) {
+            return { code: params.code, state: params.state };
         }
 
-        if (!accounts.length) return null;
-
-        // Prefer first real (non-virtual) account; fall back to first account
-        var primary = accounts.find(function(a) { return !a.isVirtual; }) || accounts[0];
-        return { primary: primary, all: accounts, raw: params };
+        return null;
     }
 
-    /* ── Handle OAuth callback on page load ─────────────────────────────── */
-    function derivOAuthHandleCallback() {
-        var result = derivOAuthParseCallback();
-        if (!result) return; // no oauth params — normal load
+    /* ── Exchange authorization code for access_token ────────────────────────── */
+    function oauthExchangeCode(code, codeVerifier, appId) {
+        var body = new URLSearchParams({
+            grant_type:    'authorization_code',
+            client_id:     appId,
+            code:          code,
+            redirect_uri:  REGISTERED_REDIRECT_URI,
+            code_verifier: codeVerifier
+        });
 
-        // Clean the URL so a refresh does not re-trigger this
+        return fetch(DERIV_OAUTH_TOKEN, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body.toString()
+        }).then(function(res) {
+            return res.json().catch(function() { return null; }).then(function(json) {
+                if (!res.ok) {
+                    var msg = (json && (json.error_description || json.error || json.message)) ||
+                              ('Token exchange failed (' + res.status + ')');
+                    throw new Error(msg);
+                }
+                if (!json || !json.access_token) {
+                    throw new Error('Token response did not include access_token');
+                }
+                return json; // { access_token, expires_in, token_type, ... }
+            });
+        });
+    }
+
+    /* ── Handle callback on page load ─────────────────────────────────────────── */
+    async function derivOAuthHandleCallback() {
+        var result = derivOAuthParseCallback();
+        if (!result) return; // normal page load — no OAuth params
+
+        // Clean URL immediately so refresh does not re-run the exchange
         try {
             var cleanUrl = window.location.href.split('#')[0].split('?')[0];
             window.history.replaceState({}, document.title, cleanUrl);
-        } catch(e) {}
+        } catch (e) {}
 
-        var primary  = result.primary;
-        var allAccts = result.all;
-        var token    = primary.token;
-        var loginid  = primary.loginid;
+        var msgEl = document.getElementById('au-msg');
+        var errEl = document.getElementById('au-err');
+        if (errEl) { errEl.innerHTML = ''; errEl.textContent = ''; }
 
-        // Restore App ID from pre-redirect storage
-        var savedAppId = '';
-        try { savedAppId = sessionStorage.getItem('deriv_oauth_appid') || ''; } catch(e) {}
-
-        var appIdEl = document.getElementById('app-id');
-        var appId = (appIdEl && appIdEl.value.trim()) || savedAppId || '';
-        if (!appId) {
-            showAuthError('App ID Missing After Redirect',
-                'Could not find the Alphanumeric App ID that was used to start OAuth. ' +
-                'Please enter it manually (example: ' + EXAMPLE_APP_ID + ') and connect using PAT.', /* UPDATED FOR ALPHANUMERIC APP ID */
-                'appid'); /* FIXED: App ID Validation Enforcement */
+        if (result.error) {
+            showAuthError('OAuth Login Cancelled',
+                result.error_description || result.error,
+                'token');
             return;
         }
 
-        /* FIXED: App ID Validation Enforcement — validateAppId() before resuming
-           the OAuth flow's connection step, even though this value was already
-           valid when the redirect started (defends against a corrupted/edited
-           sessionStorage value or a manually-edited field on return). */
+        var savedState    = '';
+        var savedVerifier = '';
+        var savedAppId    = '';
+        try {
+            savedState    = sessionStorage.getItem('deriv_oauth_state')    || '';
+            savedVerifier = sessionStorage.getItem('deriv_oauth_verifier') || '';
+            savedAppId    = sessionStorage.getItem('deriv_oauth_appid')    || '';
+        } catch (e) {}
+
+        // One-time use — clear so a refresh cannot replay the code
+        try {
+            sessionStorage.removeItem('deriv_oauth_state');
+            sessionStorage.removeItem('deriv_oauth_verifier');
+            sessionStorage.removeItem('deriv_oauth_appid');
+        } catch (e) {}
+
+        if (!savedState || result.state !== savedState) {
+            showAuthError('OAuth State Mismatch',
+                'The login response could not be verified (possible CSRF or stale tab). Please try again.',
+                'token');
+            return;
+        }
+        if (!savedVerifier) {
+            showAuthError('OAuth Session Lost',
+                'PKCE verifier missing (sessionStorage cleared). Please try Login with Deriv OAuth again.',
+                'token');
+            return;
+        }
+
+        var appIdEl = document.getElementById('app-id');
+        var appId = (appIdEl && appIdEl.value.trim()) || savedAppId || '';
         var appCheck = validateAppId(appId);
         if (!appCheck.valid) {
             showAuthError('Invalid App ID',
                 'Invalid Alphanumeric App ID. Example: ' + EXAMPLE_APP_ID + ' — ' + appCheck.reason,
-                'appid'); /* FIXED: App ID Validation Enforcement */
+                'appid');
             return;
         }
-        syncAppIdFields(appId); /* FIXED: App ID Validation Enforcement — mirrors into #app-id AND #hdr-app-id */
+        if (typeof syncAppIdFields === 'function') syncAppIdFields(appId);
 
-        // Populate PAT field and header token field
-        var patInp = document.getElementById('pat-token');
-        var apiInp = document.getElementById('api-token');
-        if (patInp) { patInp.value = token; patInp.classList.add('success'); }
-        if (apiInp) apiInp.value = token;
+        if (msgEl) msgEl.textContent = 'Exchanging authorization code for access token…';
 
-        // Update token-validation badge
-        var badge = document.getElementById('token-val-badge');
-        if (badge) {
-            badge.textContent = '✓ OAuth';
-            badge.className   = 'token-validation-badge visible valid';
-            badge.style.fontSize = '.58rem';
-            badge.style.right = '6px';
-        }
+        try {
+            var tokenResponse = await oauthExchangeCode(result.code, savedVerifier, appId);
+            var accessToken   = tokenResponse.access_token;
 
-        var msgEl = document.getElementById('au-msg');
-        if (msgEl) msgEl.textContent = '✅ OAuth login received — connecting as ' + loginid + '…';
-
-        // Configure S state and connect
-        S.eps = buildEndpoints(appId); /* FIXED: Endpoint Priority — modern derivws.com primary + retry, no legacy binaryws */
-
-        savePAT(token, false); // store for this session only
-
-        // If multiple accounts came back, let the user choose after connect
-        var pendingAccounts = (allAccts.length > 1) ? allAccts : null;
-
-        bootApp();
-        setTimeout(function() {
-            // Connect using the primary token
-            var mktEl = document.getElementById('mkt');
-            var mkt   = mktEl ? (mktEl.value || 'R_50') : 'R_50';
-            if (mktEl && !mktEl.value) mktEl.value = 'R_50';
-
-            S.tokenMkt = { token: token, mkt: mkt };
-            clearReconnectTimers();
-            S.fatalAuthError    = false;
-            S.rapidCloseCount   = 0;
-            S.lastCloseTime     = 0;
-            S.reconnectAttempts = 0;
-            S.recon             = 0;
-            S.closeIntended     = false;
-            S.wsTerminated      = false;
-
-            // NOTE: API Architecture Migration — this OAuth login path still calls
-            // openWS directly (legacy ws.derivws.com pattern). It is NOT migrated
-            // yet. Deriv's OAuth flow also changed (PKCE via auth.deriv.com, short-
-            // lived JWTs) — this whole branch needs its own separate migration if
-            // OAuth login is actually used. Left as-is since this conversation has
-            // only exercised the PAT path so far.
-            openWS(token, mkt);
-
-            // After auth, show account picker for multi-account OAuth
-            if (pendingAccounts) {
-                var acctList = pendingAccounts.map(function(a) {
-                    return { loginid: a.loginid, token: a.token, currency: a.currency,
-                             is_virtual: a.isVirtual ? 1 : 0 };
-                });
-                setTimeout(function() {
-                    handleAccountList(acctList, token);
-                }, 1800);
+            // Treat the OAuth access_token exactly like a PAT from here on
+            var patInp = document.getElementById('pat-token');
+            var apiInp = document.getElementById('api-token');
+            if (patInp) {
+                patInp.value = accessToken;
+                patInp.classList.add('success');
             }
-        }, 600);
+            if (apiInp) apiInp.value = accessToken;
+
+            var badge = document.getElementById('token-val-badge');
+            if (badge) {
+                badge.textContent = '✓ OAuth';
+                badge.className   = 'token-validation-badge visible valid';
+                badge.style.fontSize = '.58rem';
+                badge.style.right = '6px';
+            }
+
+            // Session-only by default (OAuth access tokens are short-lived ~1h)
+            savePAT(accessToken, false);
+
+            S.eps = buildEndpoints(appId);
+
+            if (msgEl) msgEl.textContent = '✅ OAuth login successful — connecting…';
+
+            // Same path as the PAT button
+            bootApp();
+            setTimeout(function() {
+                var mktEl = document.getElementById('mkt');
+                var mkt   = mktEl ? (mktEl.value || 'R_50') : 'R_50';
+                if (mktEl && !mktEl.value) mktEl.value = 'R_50';
+
+                S.tokenMkt = { token: accessToken, mkt: mkt };
+                clearReconnectTimers();
+                S.fatalAuthError    = false;
+                S.rapidCloseCount   = 0;
+                S.lastCloseTime     = 0;
+                S.reconnectAttempts = 0;
+                S.recon             = 0;
+                S.closeIntended     = false;
+                S.wsTerminated      = false;
+
+                // Public connect() entry keeps validation / circuit-breaker
+                // logic shared with the PAT path. It calls connectWithFreshOTP.
+                if (typeof connect === 'function') {
+                    connect();
+                } else {
+                    connectWithFreshOTP(accessToken, mkt);
+                }
+            }, 400);
+
+        } catch (e) {
+            showAuthError('OAuth Token Exchange Failed',
+                (e && e.message) || 'Could not obtain access token from Deriv.',
+                'token');
+            if (msgEl) msgEl.textContent = '';
+        }
     }
 
-    /* ── Run OAuth callback detection immediately on script load ─────────── */
+    /* ── Detect OAuth callback on load (new ?code= / ?error= format) ───────── */
     (function() {
-        // Check if current URL looks like an OAuth callback
-        var hashOrQuery = window.location.hash + window.location.search;
-        if (hashOrQuery && (hashOrQuery.indexOf('token1=') !== -1 || hashOrQuery.indexOf('access_token=') !== -1)) {
-            // Wait for DOM to be ready, then handle
+        var q = window.location.search || '';
+        if (q.indexOf('code=') !== -1 || q.indexOf('error=') !== -1) {
             if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', derivOAuthHandleCallback);
+                document.addEventListener('DOMContentLoaded', function() {
+                    derivOAuthHandleCallback();
+                });
             } else {
-                // DOM already ready (script is at bottom of body)
-                setTimeout(derivOAuthHandleCallback, 100);
+                setTimeout(derivOAuthHandleCallback, 50);
             }
         }
     })();
+
 
     /* ════════════════════════════════════════
        PAT LOGIN — Enhanced with error feedback
