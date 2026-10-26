@@ -4512,6 +4512,18 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     <label class="bot-label" id="b-barrier-label">Barrier (0–9)</label>
                     <input type="number" class="bot-inp" id="b-barrier" value="1" min="0" max="9">
 
+                    <div class="gate-row" style="margin-top:.55rem;">
+                        <label class="dbot-toggle">
+                            <input type="checkbox" id="b-turbo-mode" checked>
+                            <div class="dbot-toggle-track"></div>
+                            <div class="dbot-toggle-thumb"></div>
+                            <span class="dbot-toggle-label">⚡ Turbo execution — fire buy on the same tick the entry is met (minimal latency)</span>
+                        </label>
+                    </div>
+                    <div style="font-size:.65rem;color:var(--muted);margin:.15rem 0 .55rem;line-height:1.4;">
+                        When on, the bot prioritizes the WebSocket buy send before chart/UI work. Risk limits and signal gate still apply.
+                    </div>
+
                     <button class="collapsible-bot" id="coll-risk">▾ Risk Management</button>
                     <div class="coll-content" id="risk-content">
                         <div style="padding-top:.6rem;">
@@ -6282,10 +6294,15 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         return minIdx;
     }
 
-    function icocEvenOddPatternCheck(isEvenBot) {
+    function icocEvenOddPatternCheck(isEvenBot, extraDigit) {
         // DIGITEVEN → wait for 3 consecutive ODD digits then 1 EVEN digit
         // DIGITODD  → wait for 3 consecutive EVEN digits then 1 ODD digit
+        // optional extraDigit: current tick not yet pushed to S.digits (turbo path)
         var last4 = S.digits.slice(-4);
+        if (typeof extraDigit === 'number' && extraDigit >= 0 && extraDigit <= 9) {
+            last4 = last4.concat([extraDigit]);
+            if (last4.length > 4) last4 = last4.slice(-4);
+        }
         var met = false;
         if (last4.length === 4) {
             var isOddD = function(x) { return x % 2 === 1; };
@@ -6656,6 +6673,15 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         var digitStr = price.toFixed(pipDecimals);
         var digit = parseInt(digitStr.charAt(digitStr.length - 1), 10);
         var n = S.digits.length;
+
+        /* ⚡ TURBO HOT PATH — evaluate entry & fire the buy BEFORE matrix/UI work
+           so the WebSocket frame leaves the browser on the same event-loop turn
+           the tick arrived. Full botProcessTick still runs later for status text. */
+        if (S.botActive && S.turboMode && S.tradingConfig && !S.activeContractId && !S.isPlacingTrade) {
+            S.lastTick = { quote: price, digit: digit, ts: performance.now() };
+            S.lastMessageReceived = Date.now();
+            botTryFireEntryFast(digit);
+        }
 
         if (S.pending !== null) {
             var p = S.pending;
@@ -8566,6 +8592,101 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             S.buyWatchdogFailTimer = null; }
     }
 
+    /* ── Turbo helpers: entry match + prebuilt buy payload ───────────────────
+       Goal: minimize work between "tick digit matches entry" and ws.send(buy).
+       Network RTT to Deriv still dominates absolute latency; this removes
+       client-side stalls (UI, stringify from scratch, deferred status text). */
+    function botRebuildBuyPayloadCache() {
+        if (!S.tradingConfig || !S.ws) { S.buyPayloadCache = null; S.buyPayloadCacheKey = ''; return; }
+        var isRF = S.tradingConfig.contractType === 'RISE_FALL';
+        var apiContractType = S.tradingConfig.contractType;
+        var barrier = S.tradingConfig.barrier;
+        if (isRF) {
+            var direction = S.tradingConfig.entryDigits[0] === 'FALL' ? 'FALL' : 'RISE';
+            apiContractType = direction === 'FALL' ? 'PUT' : 'CALL';
+            barrier = undefined;
+        } else if (S.tradingConfig.contractType === 'DIGITEVEN' || S.tradingConfig.contractType === 'DIGITODD') {
+            barrier = undefined;
+        }
+        var stake = S.currentStake || S.initStake || 1;
+        var params = {
+            buy: '1',
+            price: stake,
+            parameters: {
+                amount: stake,
+                basis: 'stake',
+                contract_type: apiContractType,
+                currency: 'USD',
+                duration: S.tradeDuration,
+                duration_unit: 't',
+                underlying_symbol: S.tradingConfig.symbol
+            }
+        };
+        if (barrier !== undefined && barrier !== null && barrier !== '') {
+            params.parameters.barrier = String(barrier);
+        }
+        S.buyPayloadCache = params;
+        S.buyPayloadCacheKey = [apiContractType, S.tradingConfig.symbol, S.tradeDuration, barrier, stake].join('|');
+    }
+
+    function botPatchBuyStake(params, stake) {
+        params.price = stake;
+        params.parameters.amount = stake;
+        return params;
+    }
+
+    /** Lightweight entry test used on the turbo hot path (no DOM writes). */
+    function botEntryConditionMet(digit) {
+        if (!S.tradingConfig) return false;
+        if (S.directEntry) return true;
+        var ct = S.tradingConfig.contractType;
+        if (ct === 'RISE_FALL') return true;
+        if (ct === 'DIGITEVEN' || ct === 'DIGITODD') {
+            var pc = icocEvenOddPatternCheck(ct === 'DIGITEVEN', digit);
+            return !!(pc && pc.met);
+        }
+        return S.tradingConfig.entryDigits && S.tradingConfig.entryDigits.indexOf(digit) !== -1;
+    }
+
+    /** Fire trade on the same tick turn if entry is met. Returns true if a buy was sent. */
+    function botTryFireEntryFast(digit) {
+        if (!S.botActive || S.isPlacingTrade || S.activeContractId) return false;
+        if (!S.tradingConfig) return false;
+        if (!botCheckRisk()) return false;
+        if (!S.directEntry && !botShouldTradeNow()) return false;
+
+        if (!S.initialEntryMet) {
+            if (!botEntryConditionMet(digit)) return false;
+            S.initialEntryMet = true;
+            botExecuteTrade();
+            return true;
+        }
+
+        // Post-first-entry re-entries (ICOC recovery / continuous mode) — reuse same path
+        // when no open contract. Mirror the non-initial branches lightly.
+        if (S.directEntry) {
+            botExecuteTrade();
+            return true;
+        }
+        var ct = S.tradingConfig.contractType;
+        if (ct === 'RISE_FALL') {
+            botExecuteTrade();
+            return true;
+        }
+        if (ct === 'DIGITEVEN' || ct === 'DIGITODD') {
+            if (icocEvenOddPatternCheck(ct === 'DIGITEVEN', digit).met) {
+                botExecuteTrade();
+                return true;
+            }
+            return false;
+        }
+        if (S.tradingConfig.entryDigits && S.tradingConfig.entryDigits.indexOf(digit) !== -1) {
+            botExecuteTrade();
+            return true;
+        }
+        return false;
+    }
+
     function botExecuteTrade() {
         if (S.isPlacingTrade || !botCheckRisk() || !S.tradingConfig) return;
         if (!S.directEntry && !botShouldTradeNow()) {
@@ -8595,21 +8716,41 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         } else if (S.tradingConfig.contractType === 'DIGITEVEN' || S.tradingConfig.contractType === 'DIGITODD') {
             barrier = undefined;
         }
-        /* FIXED: Buy Request Schema — Deriv's current buy_request.schema.json
-           (confirmed by fetching it directly) renamed `symbol` to
-           `underlying_symbol` inside `parameters`, and `parameters` has
-           additionalProperties:false — so the old field name wasn't just
-           ignored, it failed the whole "parameters" object outright. That's
-           the literal source of "Input validation failed: parameters". The
-           schema also types `buy` and `barrier` as strings, not numbers. */
-        var params = { buy: '1', price: S.lastTradeStake, parameters: { amount: S.lastTradeStake, basis: 'stake',
-                contract_type: apiContractType, currency: 'USD', duration: S.tradeDuration, duration_unit: 't',
-                underlying_symbol: S.tradingConfig.symbol } };
-        if (barrier !== undefined) params.parameters.barrier = String(barrier);
-        S.ws.send(JSON.stringify(params));
-        cpReplicateTrade(params);
-        document.getElementById('bot-trade-status').textContent = 'Placing ' + apiContractType + ' stake:$' + S
-            .lastTradeStake.toFixed(2) + '…';
+        /* FIXED: Buy Request Schema — underlying_symbol + string barrier/buy.
+           TURBO: reuse a cached payload object when contract shape is unchanged;
+           only patch stake, then stringify + send IMMEDIATELY before any DOM work. */
+        var params;
+        var cacheKey = [apiContractType, S.tradingConfig.symbol, S.tradeDuration, barrier, S.lastTradeStake].join('|');
+        if (S.buyPayloadCache && S.buyPayloadCacheKey === cacheKey) {
+            params = S.buyPayloadCache;
+            botPatchBuyStake(params, S.lastTradeStake);
+        } else {
+            params = { buy: '1', price: S.lastTradeStake, parameters: { amount: S.lastTradeStake, basis: 'stake',
+                    contract_type: apiContractType, currency: 'USD', duration: S.tradeDuration, duration_unit: 't',
+                    underlying_symbol: S.tradingConfig.symbol } };
+            if (barrier !== undefined && barrier !== null && barrier !== '') {
+                params.parameters.barrier = String(barrier);
+            }
+            S.buyPayloadCache = params;
+            S.buyPayloadCacheKey = cacheKey;
+        }
+        // SEND FIRST — every millisecond after entry detection counts on tick charts
+        try {
+            S.ws.send(JSON.stringify(params));
+        } catch (sendErr) {
+            S.isPlacingTrade = false;
+            notify('Buy send failed: ' + (sendErr.message || sendErr), 'err');
+            return;
+        }
+        // Non-critical work after the frame is on the wire
+        queueMicrotask(function() {
+            try { cpReplicateTrade(params); } catch (e) {}
+            var statusEl = document.getElementById('bot-trade-status');
+            if (statusEl) {
+                statusEl.textContent = (S.turboMode ? '⚡ ' : '') + 'Placing ' + apiContractType +
+                    ' stake:$' + S.lastTradeStake.toFixed(2) + '…';
+            }
+        });
 
         clearBuyWatchdog();
         S.buyWatchdogWarnTimer = setTimeout(function() {
@@ -8989,15 +9130,19 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         S.directEntryNext = false;
         S.isPlacingTrade = false;
         S.botActive = true;
+        S.turboMode = !!(document.getElementById('b-turbo-mode') && document.getElementById('b-turbo-mode').checked);
         S.currentStake = S.secondStake;
         S.recoveryActive = false;
         S.tradeStartTickIndex = null;
         S.lastTradeStake = 0;
         S.lastTradeWasLoss = false;
         S.pendingRecoveryStop = false;
+        botRebuildBuyPayloadCache();
         botUpdateStatsUI();
         document.getElementById('b-log').textContent = '';
-        document.getElementById('bot-trade-status').textContent = 'Bot started — waiting for entry condition…';
+        document.getElementById('bot-trade-status').textContent = S.turboMode
+            ? '⚡ Bot started (Turbo) — waiting for entry; buy fires on the same tick…'
+            : 'Bot started — waiting for entry condition…';
         document.getElementById('b-start').disabled = true;
         document.getElementById('b-stop').disabled = false;
         if (UM.currentUser) {
