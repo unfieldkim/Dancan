@@ -3862,15 +3862,15 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 </head>
 <body>
 
-    <!-- Floating help button — opens the "Connect with PAT" walkthrough. Fixed position, so it's visible on both the login screen and the main app. -->
+    <!-- Floating help button — opens the connection walkthrough. Fixed position, so it's visible on both the login screen and the main app. -->
     <button id="help-fab" title="How to connect — step-by-step guide" aria-label="Open help walkthrough">?</button>
 
     <!-- Help walkthrough modal -->
-    <div id="help-modal-overlay" role="dialog" aria-modal="true" aria-label="Connect with PAT walkthrough">
+    <div id="help-modal-overlay" role="dialog" aria-modal="true" aria-label="How to connect walkthrough">
         <div class="help-modal-box">
             <button class="help-modal-close" id="help-modal-close" aria-label="Close">✕</button>
             <p class="help-eyebrow">Setup Walkthrough</p>
-            <h2 class="help-h1">Connect with PAT</h2>
+            <h2 class="help-h1">How to Connect</h2>
             <div class="help-rail" id="help-rail"></div>
             <div id="help-step-content"></div>
             <div class="help-nav">
@@ -3881,7 +3881,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         </div>
     </div>
 
-    <!-- ════════════ AUTH — PAT LOGIN ════════════ -->
+    <!-- ════════════ AUTH — OAuth Login ════════════ -->
     <div id="auth">
         <div class="auth-box">
             <div style="position:relative;width:68px;height:68px;margin:0 auto 1rem;display:flex;align-items:center;justify-content:center;z-index:1;">
@@ -3890,9 +3890,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             </div>
 
             <h2>Deriv <span style="background:linear-gradient(90deg,#3b82f6,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">Unified Platform</span></h2>
-            <p class="sub">Digit Flow Analysis &nbsp;·&nbsp; Ultra-Fast Bot &nbsp;·&nbsp; DBot Bridge &nbsp;·&nbsp; Copy Trading<br><span style="font-size:.65em;opacity:.7;">OAuth 2.0 &amp; Long-String PAT &nbsp;·&nbsp; Alphanumeric App ID</span></p>
+            <p class="sub">Digit Flow Analysis &nbsp;·&nbsp; Ultra-Fast Bot &nbsp;·&nbsp; DBot Bridge &nbsp;·&nbsp; Copy Trading<br><span style="font-size:.65em;opacity:.7;">OAuth 2.0 Secure Login</span></p>
 
-            <!-- OAuth / PAT Login Panel -->
+            <!-- OAuth Login Panel (PAT login removed) -->
             <div id="au-pat-panel" style="position:relative;z-index:1;">
 
                 <!-- ── OAuth One-Click Login ── -->
@@ -3901,63 +3901,30 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     Login with Deriv OAuth
                 </button>
 
-                <div class="auth-divider" style="position:relative;z-index:1;">
-                    <hr /><span>OR USE PAT</span><hr />
-                </div>
+                <p style="font-size:.68rem;color:var(--muted);margin:.15rem 0 .85rem;line-height:1.4;position:relative;z-index:1;">
+                    Secure one-click login. Existing Deriv members: use OAuth above.
+                </p>
 
-                <!-- App ID — supports long alphanumeric strings /* UPDATED FOR ALPHANUMERIC APP ID */ -->
-                <!-- FIXED: App ID Validation Enforcement — live-validated on input via liveValidateAppIdField(), synced to #hdr-app-id via syncAppIdFields(), checked by validateAppId() before every connect/PAT-test/OAuth attempt -->
-                <!-- HARDCODED APP ID: hidden from the front end — the field still exists in the
-                     DOM (pre-filled, see value= below) so every existing JS read/write path
-                     (getCurrentAppId, syncAppIdFields, liveValidateAppIdField) keeps working
-                     unchanged. Only its visual presence on the login screen is removed. -->
+                <!-- App ID kept in DOM (hidden) for OAuth / API calls -->
                 <div style="display:none;">
-                <div style="position:relative;">
-                    <input class="auth-inp" id="app-id"
-                        placeholder="Alphanumeric App ID — e.g. 34l8UBN1Da3Qe5BQMlBpX"
-                        value="34l8UBN1Da3Qe5BQMlBpX" autocomplete="off" maxlength="128"
-                        style="font-family:var(--ffm);padding-right:2.2rem;" spellcheck="false" />
+                    <input class="auth-inp" id="app-id" type="text" value="34l8UBN1Da3Qe5BQMlBpX" maxlength="128" autocomplete="off" spellcheck="false" />
                     <span class="token-validation-badge" id="appid-val-badge"></span>
-                </div>
-                <!-- UPDATED FOR ALPHANUMERIC APP ID: highlighted support note -->
-                <div style="font-size:.62rem;color:#22c55e;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:6px;padding:.25rem .5rem;margin:-.15rem 0 .45rem;text-align:left;position:relative;z-index:1;font-weight:600;">
-                    ✅ Alphanumeric App ID Supported
-                </div>
-                <div style="font-size:.6rem;color:var(--muted);margin:-.4rem 0 .6rem;text-align:left;padding-left:2px;position:relative;z-index:1;">
-                    Use your Alphanumeric App ID only (example: 34l8UBN1Da3Qe5BQMlBpX). Register your application at <a href="https://developers.deriv.com" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none;">developers.deriv.com</a>
-                </div>
-                </div>
-                <!-- /HARDCODED APP ID hidden block -->
-
-                <!-- PAT — accepts any length / any alphanumeric+special format -->
-                <div style="position:relative;">
-                    <input class="auth-inp" id="pat-token" type="password"
-                        placeholder="Personal Access Token (any length)"
-                        autocomplete="off" maxlength="512"
-                        style="padding-right:2.2rem;" />
+                    <!-- Hidden PAT fields retained so legacy scripts do not throw -->
+                    <input class="auth-inp" id="pat-token" type="password" value="" maxlength="512" autocomplete="off" />
                     <span class="token-validation-badge" id="token-val-badge"></span>
-                </div>
-                <div style="font-size:.6rem;color:var(--muted);margin:-.4rem 0 .7rem;text-align:left;padding-left:2px;position:relative;z-index:1;">
-                    Supports new long-string PAT tokens (alphanumeric + special chars)
-                </div>
-
-                <!-- UPDATED PAT AUTH FLOW: live validation / scope / account status panel -->
-                <div id="pat-auth-status" style="display:none;background:rgba(255,255,255,.03);border:1px solid var(--b1);border-radius:8px;padding:.55rem .65rem;margin:-.15rem 0 .7rem;text-align:left;position:relative;z-index:1;font-size:.66rem;line-height:1.45;">
-                    <div id="pat-validation-line" style="display:flex;align-items:center;gap:.4rem;font-weight:600;">—</div>
-                    <div id="pat-scope-status" style="display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.35rem;"></div>
-                    <div id="pat-account-status" style="margin-top:.35rem;color:var(--muted);"></div>
-                </div>
-
-                <label class="auth-remember">
+                    <div id="pat-auth-status" style="display:none;">
+                        <div id="pat-validation-line">—</div>
+                        <div id="pat-scope-status"></div>
+                        <div id="pat-account-status"></div>
+                    </div>
                     <input type="checkbox" id="remember-pat" />
-                    Remember Me (saves token locally)
-                </label>
-                <button class="auth-btn" id="pat-login-btn">🔑 Connect with PAT</button>
+                    <button type="button" id="pat-login-btn" style="display:none;">Connect with PAT</button>
+                </div>
 
                 <div class="auth-divider" style="position:relative;z-index:1;">
                     <hr /><span>NEW TO DERIV?</span><hr />
                 </div>
-                <a href="https://track.deriv.com/_Cv4ieVNXu6j1hit6RV3zsGNd7ZgqdRLk/1/" target="_blank" rel="noopener"
+                <a href="https://t.deriv.link?t=VUYUV7UTFFBV" target="_blank" rel="noopener"
                     class="auth-create-link"
                     onmouseover="this.style.background='rgba(139,92,246,.12)'" onmouseout="this.style.background='transparent'">
                     🎁 Create a Free Deriv Account
@@ -3968,13 +3935,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             </div>
 
         <div class="auth-badges">
-            <span>🔒 OAuth + PAT</span>
+            <span>🔒 OAuth Login</span>
             <span class="sep">·</span>
             <span>⚡ Real-time WebSocket</span>
             <span class="sep">·</span>
             <span>🤖 AI Signal Engine</span>
             <span class="sep">·</span>
-            <span>🆔 Long-String Tokens</span>
+            <span>🆕 Free Sign-Up</span>
         </div>
     </div>
 </div>
@@ -3983,7 +3950,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 <div id="app">
     <div class="hdr">
         <div class="hdr-title">Deriv <span>Unified</span> <em>Platform</em></div>
-        <a href="https://track.deriv.com/_Cv4ieVNXu6j1hit6RV3zsGNd7ZgqdRLk/1/" target="_blank" rel="noopener"
+        <a href="https://t.deriv.link?t=VUYUV7UTFFBV" target="_blank" rel="noopener"
         style="font-size:.6rem;color:var(--muted);text-decoration:none;display:flex;align-items:center;gap:.22rem;border:1px solid var(--b1);border-radius:6px;padding:.18rem .45rem;transition:border .2s;flex-shrink:0;"
         title="Trade on Deriv" onmouseover="this.style.borderColor='var(--red)';this.style.color='var(--red)'" onmouseout="this.style.borderColor='var(--b1)';this.style.color='var(--muted)'">
         Powered by <b style="color:inherit;">Deriv</b>
@@ -11031,23 +10998,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             }
         });
 
-        // Auto-login if token is stored
-        var autoToken = getStoredPAT();
-        if (autoToken) {
-            setTimeout(function() {
-                document.getElementById('pat-token').value = autoToken;
-                var val = validateToken(autoToken);
-                if (val.valid) {
-                    var badge = document.getElementById('token-val-badge');
-                    badge.textContent = '✓';
-                    badge.className = 'token-validation-badge visible valid';
-                    document.getElementById('pat-token').classList.add('success');
-                }
-                setTimeout(function() {
-                    document.getElementById('pat-login-btn').click();
-                }, 400);
-            }, 200);
-        }
+        // PAT login UI removed — no auto-login with stored PAT.
+        // Members sign in via OAuth; new users register via the sign-up link.
     })();
 
     /* ════════════════════════════════════════
@@ -11366,69 +11318,50 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     // ── Help Walkthrough — fully self-contained, no dependency on PAT/OAuth/auth code ──
     var helpSteps = [
         {
-            tag: 'Deriv account',
-            title: 'Log in to your Deriv account',
-            body: 'Go to your Deriv account and sign in as you normally would. This is where you\'ll generate the key that lets this platform trade on your behalf.',
-            tip: { type: 'note', text: 'Keep this tab open — you\'ll come back here right after copying the token.' }
+            tag: 'New members',
+            title: 'Create your Deriv account',
+            body: 'If you are new to Deriv, open the <b>Create a Free Deriv Account</b> link on the login screen, complete registration, then return here to log in.',
+            tip: { type: 'note', text: 'After signing up, use Login with Deriv OAuth on this platform.' }
         },
         {
-            tag: 'API Token page',
-            title: 'Open the API Token page',
-            body: 'From your account settings, find the <b>API Token</b> section. This is where new tokens are generated for connecting third-party tools like this platform.',
-            tip: { type: 'note', text: 'It\'s usually under Settings → Security and Limits → API token.' }
+            tag: 'Verify email',
+            title: 'Complete Deriv registration',
+            body: 'Finish sign-up on Deriv (email verification and account details). You can create a demo account first to practice safely.',
+            tip: { type: 'note', text: 'Keep this platform tab open so you can return and log in right away.' }
         },
         {
-            tag: 'Create token',
-            title: 'Create a token with Trade + Read access',
-            body: 'Give the token a name, then <b>tick both the "Trade" and "Read" scopes</b>. These two permissions let the platform place trades and read your account data. Click <b>Create</b>.',
-            tip: { type: 'caution', text: 'Both boxes matter — if either is unticked, the connection will fail or be read-only.' }
+            tag: 'OAuth login',
+            title: 'Log in with Deriv OAuth',
+            body: 'Back on this platform, click <b>Login with Deriv OAuth</b>. You will be redirected to Deriv to authorize securely — no API token paste required.',
+            tip: { type: 'caution', text: 'Only approve the login on the official Deriv page. Never share passwords or tokens with anyone.' }
         },
         {
-            tag: 'Copy token',
-            title: 'Copy the token',
-            body: 'Deriv shows the token once. Click the copy icon next to it right away, and keep it somewhere safe — you won\'t be able to view it again after leaving the page.',
-            tip: { type: 'caution', text: 'Treat this token like a password. Anyone with it can trade on your account.' }
+            tag: 'Approve access',
+            title: 'Allow trading access',
+            body: 'On Deriv\'s authorization screen, approve the requested permissions so this platform can place trades and read account data for you.',
+            tip: { type: 'note', text: 'After approval you return here automatically and the connection starts.' }
         },
         {
-            tag: 'Connect',
-            title: 'Paste the token and press Connect with PAT',
-            body: 'Back here, paste the copied token into the token field, then click <b>Connect with PAT</b>. The status indicator in the header turns green once the connection succeeds.',
-            tip: { type: 'note', text: 'If it doesn\'t connect, re-copy the token — a trailing space is the most common cause.' }
+            tag: 'Choose account',
+            title: 'Select Demo or Real',
+            body: 'If you have more than one account, pick <b>Demo</b> to practice or <b>Real</b> for live trading. Confirm with <b>Keep current</b> when asked again.',
+            tip: { type: 'note', text: 'Demo is ideal while you learn the bot and scanners.' }
         },
         {
-            tag: 'Volatility Index',
-            title: 'Choose your Volatility Index',
-            body: 'Once connected, pick the Volatility Index you want to work with (e.g. V75, V100) from the Market selector.',
-            tip: { type: 'note', text: 'You can switch indices at any time — this just tells the platform which feed to analyze.' }
-        },
-        {
-            tag: 'Reset',
-            title: 'Click the reset icon — fast',
-            body: 'Right after selecting your Volatility Index, click the <b>reset icon</b> promptly. This refreshes the session feed so it\'s in sync with the index you just picked.',
-            tip: { type: 'caution', text: 'Do this quickly after switching — waiting too long can leave the feed on the previous index.' }
-        },
-        {
-            tag: 'Account',
-            title: 'Connect to Demo or Real',
-            body: 'Choose the account you want to use — <b>Demo</b> for practice or <b>Real</b> for live trading.',
-            tip: { type: 'note', text: 'Demo is a good place to confirm everything is wired up before switching to Real.' }
-        },
-        {
-            tag: 'Confirm',
-            title: 'When asked again, click "Keep current"',
-            body: 'After choosing your account, the platform asks which account to use one more time. Click <b>Keep current</b> to confirm and lock it in.',
-            tip: { type: 'note', text: 'This second prompt is just a confirmation step — no need to re-select anything.' }
+            tag: 'Market',
+            title: 'Pick a Volatility Index',
+            body: 'Choose the market you want (for example V75 / R_75) from the market selector, then use reset if needed so the live feed matches your choice.',
+            tip: { type: 'note', text: 'You can change markets anytime.' }
         },
         {
             tag: 'Done',
-            title: 'Start analysis',
-            body: 'You\'re fully connected. Click <b>Start Analysis</b> to begin.',
+            title: 'Start analysis or trading',
+            body: 'You are connected. Use Start Analysis, the Market Scanner, or the bot panel when you are ready.',
             checklist: [
-                'Token created with Trade + Read scopes',
-                'Connected with PAT',
-                'Volatility Index selected',
-                'Feed reset',
-                'Account confirmed (Demo/Real)'
+                'Account created (if new)',
+                'Logged in with Deriv OAuth',
+                'Demo or Real account selected',
+                'Market chosen'
             ]
         }
     ];
