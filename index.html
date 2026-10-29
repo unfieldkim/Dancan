@@ -4445,7 +4445,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
-                            <button class="ai-scan-btn" id="ai-scan-btn" title="Compare recent tick statistics across available markets" aria-label="Open Market Scanner"><span class="ai-ico">✦</span>&nbsp;Market Scan</button>
+                            <button class="ai-scan-btn" id="ai-scan-btn" title="Neural scan: real Deriv historical ticks, live frequency & pattern layers" aria-label="Open Neural Market Scanner"><span class="ai-ico">✦</span>&nbsp;Market Scan</button>
                         </div>
                         <button class="as-btn" id="as-apply-btn" disabled>
                             ⚡ Apply Best Settings for Selected Contract
@@ -5035,6 +5035,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         lastPingSent: 0,
         pongReceived: true,
         historyCallback: null,
+        historyCallbacks: {},
         rapidCloseCount: 0,
         lastCloseTime: 0,
         bannerTimeout: null,
@@ -7490,6 +7491,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 return;
             }
             if (d.msg_type === 'history') {
+                /* Concurrent neural scanner: route by req_id when present */
+                if (d.req_id != null && S.historyCallbacks && S.historyCallbacks[d.req_id]) {
+                    var _hcb = S.historyCallbacks[d.req_id];
+                    delete S.historyCallbacks[d.req_id];
+                    try { _hcb(d); } catch (e) {}
+                    return;
+                }
                 if (S.historyCallback) { var _aicb = S.historyCallback;
                     S.historyCallback = null;
                     _aicb(d); }
@@ -9198,8 +9206,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     ];
     var AIS = {
         active: false, finished: false, runId: 0, ct: '', idx: 0, results: [], best: null,
-        markets: [], tickCount: 200, callback: null,
-        autoExec: false, autoMin: 'ANY', autoTimer: null, timeoutTimer: null, skipped: []
+        markets: [], tickCount: 1000, callback: null,
+        autoExec: false, autoMin: 'ANY', autoTimer: null, timeoutTimer: null, skipped: [],
+        inFlight: 0, maxConcurrent: 3, pendingTimers: {}, reqSeq: 900000, gapMs: 35
     };
 
     /* FIXED: Invalid Symbol List — see the active_symbols handler in ws.onmessage
@@ -9295,6 +9304,80 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         doLog('⟳ Previous market history cleared — starting fresh', 'info');
     }
 
+    /* ── Neural ensemble helpers ─────────────────────────────────────────── */
+    function _aisDigitFromPrice(p) {
+        var x = parseFloat(p);
+        if (!isFinite(x)) return 0;
+        return Math.abs(Math.floor(x * 100 + 1e-8)) % 10;
+    }
+    function _aisSoftmax(arr, temp) {
+        temp = temp || 1;
+        var m = Math.max.apply(null, arr);
+        var ex = arr.map(function(v) { return Math.exp((v - m) / temp); });
+        var s = ex.reduce(function(a, b) { return a + b; }, 0) || 1;
+        return ex.map(function(v) { return v / s; });
+    }
+    function _aisChiSquare(counts, n) {
+        var exp = n / 10, chi = 0;
+        for (var i = 0; i < 10; i++) {
+            var d = counts[i] - exp;
+            chi += (d * d) / (exp || 1);
+        }
+        return Math.min(1, chi / 30);
+    }
+    function _aisEntropy(probs) {
+        var h = 0;
+        for (var i = 0; i < probs.length; i++) {
+            if (probs[i] > 1e-12) h -= probs[i] * Math.log(probs[i]);
+        }
+        return h / Math.log(10);
+    }
+    function _aisWindowFreq(digits, win) {
+        var slice = digits.length > win ? digits.slice(-win) : digits;
+        var c = new Array(10).fill(0);
+        for (var i = 0; i < slice.length; i++) c[slice[i]]++;
+        var n = slice.length || 1;
+        return c.map(function(v) { return v / n; });
+    }
+    function _aisStreak(digits) {
+        if (!digits.length) return { len: 0, digit: null };
+        var d = digits[digits.length - 1], len = 1;
+        for (var i = digits.length - 2; i >= 0; i--) {
+            if (digits[i] === d) len++; else break;
+        }
+        return { len: len, digit: d };
+    }
+    function _aisAlternation(digits) {
+        if (digits.length < 2) return 0.5;
+        var alt = 0;
+        for (var i = 1; i < digits.length; i++) if (digits[i] !== digits[i - 1]) alt++;
+        return alt / (digits.length - 1);
+    }
+    function _aisPatternLabel(digits, freqSkew, streak, alt, entropy) {
+        if (streak.len >= 4) return 'STREAK×' + streak.len + '→' + streak.digit;
+        if (alt >= 0.78) return 'ALTERNATING';
+        if (freqSkew >= 0.55 && entropy < 0.92) return 'HOT-COLD';
+        if (entropy < 0.85) return 'CLUSTERED';
+        if (freqSkew < 0.25 && entropy > 0.97) return 'UNIFORM';
+        return 'MIXED';
+    }
+
+    function aiScanClearCallback() {
+        if (AIS.callback && S.historyCallback === AIS.callback) S.historyCallback = null;
+        AIS.callback = null;
+        if (S.historyCallbacks) {
+            Object.keys(S.historyCallbacks).forEach(function(k) { delete S.historyCallbacks[k]; });
+        }
+        if (AIS.pendingTimers) {
+            Object.keys(AIS.pendingTimers).forEach(function(k) {
+                clearTimeout(AIS.pendingTimers[k]);
+                delete AIS.pendingTimers[k];
+            });
+        }
+        AIS.inFlight = 0;
+    }
+
+
     function aiScanClearCallback() {
         if (AIS.callback && S.historyCallback === AIS.callback) S.historyCallback = null;
         AIS.callback = null;
@@ -9314,7 +9397,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         var marketSelect = document.getElementById('aiscan-market');
         var count = multi ? AI_MARKETS.length : (marketSelect.value ? 1 : 0);
         singleWrap.style.display = multi ? 'none' : 'flex';
-        document.getElementById('aiscan-scope-summary').textContent = multi ?
+        document.getElementById('aiscan-scope-summary').textContent = multi ? /*neural*/
             AI_MARKETS.length + ' currently available markets will be scanned one by one.' :
             'Only the selected market will be included in this scan.';
         var start = document.getElementById('aiscan-start');
@@ -9348,7 +9431,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         var currentMarket = document.getElementById('mkt').value;
         marketSelect.value = AI_MARKETS.some(function(mkt) { return mkt.sym === currentMarket; }) ?
             currentMarket : (AI_MARKETS[0] ? AI_MARKETS[0].sym : '');
-        document.getElementById('aiscan-ticks').value = '200';
+        document.getElementById('aiscan-ticks').value = '1000';
         document.getElementById('aiscan-multi-markets').checked = true;
         document.getElementById('aiscan-auto-exec').checked = false;
         document.getElementById('aiscan-auto-min').value = 'ANY';
@@ -9360,7 +9443,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         document.getElementById('aiscan-setup').style.display = 'block';
         document.getElementById('aiscan-results-view').style.display = 'none';
         document.getElementById('aiscan-sub').textContent =
-            'Choose a contract and scan scope. Results only populate bot settings when you select one.';
+            'Neural market scan — real Deriv historical ticks, live frequency & pattern layers.';
         aiScanPopulateSetup();
     }
 
@@ -9381,15 +9464,17 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         AIS.active = true;
         AIS.finished = false;
         AIS.ct = document.getElementById('aiscan-contract').value;
-        AIS.tickCount = parseInt(document.getElementById('aiscan-ticks').value, 10) || 200;
+        AIS.tickCount = Math.min(5000, Math.max(50, parseInt(document.getElementById('aiscan-ticks').value, 10) || 1000));
         AIS.idx = 0;
         AIS.results = [];
         AIS.best = null;
         AIS.callback = null;
         AIS.skipped = [];
+        AIS.inFlight = 0;
         AIS.autoExec = document.getElementById('aiscan-auto-exec').checked;
         AIS.autoMin = document.getElementById('aiscan-auto-min').value;
         aiScanCancelAuto(true);
+        aiScanClearCallback();
         if (AIS.autoExec) {
             if (S.botActive) {
                 AIS.autoExec = false;
@@ -9406,127 +9491,171 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         document.getElementById('aiscan-tbody').innerHTML = '';
         document.getElementById('aiscan-ph').style.display = 'block';
         document.getElementById('aiscan-ph').innerHTML =
-            '<div style="font-size:2.5rem;margin-bottom:.45rem;">◌</div>Collecting tick samples from your selected markets…';
+            '<div style="font-size:2.5rem;margin-bottom:.45rem;">⚡</div>Neural scan — streaming real Deriv ticks_history in parallel…';
         document.getElementById('aiscan-apply-best').disabled = true;
         document.getElementById('aiscan-new').style.display = 'none';
         document.getElementById('ai-scan-btn').disabled = true;
         document.getElementById('aiscan-cancel').textContent = 'Stop scan';
         document.getElementById('aiscan-prog-fill').style.width = '0%';
         document.getElementById('aiscan-pct').textContent = '0%';
-        document.getElementById('aiscan-prog-txt').textContent = 'Initialising scan…';
-        document.getElementById('aiscan-sub').textContent = 'Contract: ' + AIS.ct + ' · ' +
-            AIS.markets.length + ' market' + (AIS.markets.length === 1 ? '' : 's') +
-            ' · up to ' + AIS.tickCount + ' ticks each';
-        document.getElementById('aiscan-foot-txt').textContent = 'Fetching recent market history…';
-        aiScanNext(AIS.runId);
+        document.getElementById('aiscan-prog-txt').textContent = 'Launching parallel tick fetch…';
+        document.getElementById('aiscan-foot-txt').textContent = 'Fetching real market history from Deriv…';
+        doLog('⚡ Neural Market Scan — ' + AIS.markets.length + ' market(s), ' + AIS.tickCount + ' ticks, concurrency ' + AIS.maxConcurrent, 'info');
+        aiScanPump(AIS.runId);
     }
 
-    function aiScanNext(runId) {
+
+    function aiScanNext(runId) { aiScanPump(runId); }
+
+    function aiScanPump(runId) {
         if (runId !== AIS.runId) return;
         if (!AIS.active) { aiScanFinish('Scan stopped'); return; }
-        if (AIS.idx >= AIS.markets.length) { aiScanFinish('Scan complete'); return; }
-        var mkt = AIS.markets[AIS.idx];
-        var pct = Math.round(AIS.idx / AIS.markets.length * 100);
-        document.getElementById('aiscan-prog-fill').style.width = pct + '%';
-        document.getElementById('aiscan-pct').textContent = pct + '%';
-        document.getElementById('aiscan-prog-txt').textContent = 'Fetching ' + mkt.name + ' (' + (AIS.idx + 1) + '/' +
-            AIS.markets.length + ')';
-        var scanCallback = function(data) {
-            if (runId !== AIS.runId || !AIS.active) return;
-            if (AIS.callback === scanCallback) AIS.callback = null;
-            if (AIS.timeoutTimer) { clearTimeout(AIS.timeoutTimer); AIS.timeoutTimer = null; }
-            var ok = false;
-            try {
-                var prices = (data.history && data.history.prices) || [];
-                if (prices.length >= 30) {
-                    var digits = prices.map(function(p) { return Math.floor(parseFloat(p) * 100) % 10; });
-                    var r = aiScanAnalyze(mkt, digits, AIS.ct);
-                    r.sampleCount = digits.length;
-                    AIS.results.push(r);
-                    aiScanAddRow();
-                    ok = true;
-                }
-            } catch (e) {}
-            if (!ok) AIS.skipped.push(mkt.name);
+        while (AIS.active && AIS.inFlight < AIS.maxConcurrent && AIS.idx < AIS.markets.length) {
+            aiScanLaunchOne(runId, AIS.markets[AIS.idx], AIS.idx);
             AIS.idx++;
-            setTimeout(function() { aiScanNext(runId); }, 130);
-        };
-        AIS.callback = scanCallback;
-        S.historyCallback = scanCallback;
-        /* A market that never answers used to hang the whole scan — give each one 8s, then skip it. */
-        AIS.timeoutTimer = setTimeout(function() {
-            if (runId !== AIS.runId || !AIS.active || AIS.callback !== scanCallback) return;
-            AIS.timeoutTimer = null;
-            if (S.historyCallback === scanCallback) S.historyCallback = null;
-            AIS.callback = null;
-            AIS.skipped.push(mkt.name);
-            doLog('⏱ Scanner: ' + mkt.name + ' did not respond in 8s — skipped', 'warn');
-            AIS.idx++;
-            aiScanNext(runId);
-        }, 8000);
-        try {
-            S.ws.send(JSON.stringify({ ticks_history: mkt.sym, adjust_start_time: 1, count: AIS.tickCount,
-                end: 'latest', style: 'ticks' }));
-        } catch (e) {
-            if (S.historyCallback === scanCallback) S.historyCallback = null;
-            if (AIS.callback === scanCallback) AIS.callback = null;
-            if (AIS.timeoutTimer) { clearTimeout(AIS.timeoutTimer); AIS.timeoutTimer = null; }
-            AIS.skipped.push(mkt.name);
-            AIS.idx++;
-            setTimeout(function() { aiScanNext(runId); }, 130);
+        }
+        if (AIS.inFlight === 0 && AIS.idx >= AIS.markets.length) {
+            aiScanFinish('Scan complete');
         }
     }
+
+    function aiScanLaunchOne(runId, mkt, slot) {
+        AIS.inFlight++;
+        var done = Math.max(0, (AIS.results.length + AIS.skipped.length));
+        var pct = Math.round((done / Math.max(1, AIS.markets.length)) * 100);
+        document.getElementById('aiscan-prog-fill').style.width = pct + '%';
+        document.getElementById('aiscan-pct').textContent = pct + '%';
+        document.getElementById('aiscan-prog-txt').textContent =
+            'Neural fetch ' + mkt.name + ' · in-flight ' + AIS.inFlight + '/' + AIS.maxConcurrent +
+            ' · done ' + done + '/' + AIS.markets.length;
+
+        var reqId = (AIS.reqSeq = (AIS.reqSeq || 900000) + 1);
+        var finished = false;
+
+        function complete(ok, data) {
+            if (finished || runId !== AIS.runId) return;
+            finished = true;
+            if (AIS.pendingTimers && AIS.pendingTimers[reqId]) {
+                clearTimeout(AIS.pendingTimers[reqId]);
+                delete AIS.pendingTimers[reqId];
+            }
+            if (S.historyCallbacks) delete S.historyCallbacks[reqId];
+            AIS.inFlight = Math.max(0, AIS.inFlight - 1);
+            if (ok && data) {
+                try {
+                    var prices = (data.history && data.history.prices) || [];
+                    if (prices.length >= 30) {
+                        var digits = prices.map(_aisDigitFromPrice);
+                        var r = aiScanAnalyze(mkt, digits, AIS.ct);
+                        r.sampleCount = digits.length;
+                        AIS.results.push(r);
+                        aiScanAddRow();
+                    } else {
+                        AIS.skipped.push(mkt.name);
+                    }
+                } catch (e) {
+                    AIS.skipped.push(mkt.name);
+                }
+            } else {
+                AIS.skipped.push(mkt.name);
+            }
+            var done2 = AIS.results.length + AIS.skipped.length;
+            var pct2 = Math.round((done2 / Math.max(1, AIS.markets.length)) * 100);
+            document.getElementById('aiscan-prog-fill').style.width = pct2 + '%';
+            document.getElementById('aiscan-pct').textContent = pct2 + '%';
+            setTimeout(function() { aiScanPump(runId); }, AIS.gapMs || 35);
+        }
+
+        if (!S.historyCallbacks) S.historyCallbacks = {};
+        if (!AIS.pendingTimers) AIS.pendingTimers = {};
+        S.historyCallbacks[reqId] = function(data) { complete(true, data); };
+        AIS.pendingTimers[reqId] = setTimeout(function() {
+            if (finished || runId !== AIS.runId) return;
+            doLog('⏱ Neural scanner: ' + mkt.name + ' timed out — skipped', 'warn');
+            complete(false, null);
+        }, 7000);
+
+        try {
+            S.ws.send(JSON.stringify({
+                ticks_history: mkt.sym,
+                adjust_start_time: 1,
+                count: AIS.tickCount,
+                end: 'latest',
+                style: 'ticks',
+                req_id: reqId
+            }));
+        } catch (e) {
+            complete(false, null);
+        }
+    }
+
 
     function aiScanAnalyze(mkt, digits, ct) {
         var n = digits.length;
         var dc = new Array(10).fill(0);
         var tm = [];
         for (var ti = 0; ti < 10; ti++) tm.push(new Array(10).fill(0));
-        for (var i = 0; i < n; i++) { dc[digits[i]]++;
-            if (i > 0) tm[digits[i - 1]][digits[i]]++; }
-        var exp = n / 10,
-            sc = dc.map(function(c) { return exp - c; });
-        var sh = Math.min.apply(null, sc),
-            sv = sc.map(function(s) { return s - sh + 0.01; });
-        var svS = sv.reduce(function(a, b) { return a + b; }, 0);
+        for (var i = 0; i < n; i++) {
+            dc[digits[i]]++;
+            if (i > 0) tm[digits[i - 1]][digits[i]]++;
+        }
+        var exp = n / 10;
+        var sc = dc.map(function(c) { return exp - c; });
+        var sh = Math.min.apply(null, sc);
+        var sv = sc.map(function(s) { return s - sh + 0.01; });
+        var svS = sv.reduce(function(a, b) { return a + b; }, 0) || 1;
         var frP = sv.map(function(s) { return s / svS; });
-        var last = digits[n - 1],
-            row = tm[last],
-            rowS = row.reduce(function(a, b) { return a + b; }, 0);
+
+        var last = digits[n - 1];
+        var row = tm[last];
+        var rowS = row.reduce(function(a, b) { return a + b; }, 0);
         var m1P = rowS > 0 ? row.map(function(v) { return v / rowS; }) : new Array(10).fill(0.1);
+
         var ls = new Array(10).fill(-1);
-        for (var i = 0; i < n; i++) ls[digits[i]] = i;
+        for (var j = 0; j < n; j++) ls[digits[j]] = j;
         var gaps = ls.map(function(idx) { return idx === -1 ? n : n - 1 - idx; });
         var gpS = gaps.reduce(function(a, b) { return a + b; }, 0) || 1;
         var gpP = gaps.map(function(g) { return g / gpS; });
-        var raw = m1P.map(function(p, i) { return p * 0.45 + frP[i] * 0.35 + gpP[i] * 0.20; });
-        var rawS = raw.reduce(function(a, b) { return a + b; }, 0);
-        var nv = raw.map(function(v) { return v / rawS; });
-        var sorted = Array.from({ length: 10 }, function(_, i) { return i; }).sort(function(a, b) { return nv[b] - nv[
-            a]; });
+
+        var f25 = _aisWindowFreq(digits, 25);
+        var f50 = _aisWindowFreq(digits, 50);
+        var fullP = dc.map(function(c) { return c / n; });
+        var mom = f25.map(function(v, i) { return v - fullP[i]; });
+        var momSoft = _aisSoftmax(mom.map(function(v) { return v * 12; }), 1);
+
+        var freqSkew = _aisChiSquare(dc, n);
+        var entropy = _aisEntropy(fullP);
+        var streak = _aisStreak(digits);
+        var alt = _aisAlternation(digits.slice(-80));
+        var pattern = _aisPatternLabel(digits, freqSkew, streak, alt, entropy);
+
+        var raw = [];
+        for (var k = 0; k < 10; k++) {
+            raw[k] = m1P[k] * 0.28 + frP[k] * 0.18 + gpP[k] * 0.12 + f25[k] * 0.18 + f50[k] * 0.12 + momSoft[k] * 0.12;
+        }
+        var nv = _aisSoftmax(raw.map(function(v) { return Math.log(Math.max(v, 1e-9)); }), 0.85);
+        var sorted = Array.from({ length: 10 }, function(_, i) { return i; }).sort(function(a, b) { return nv[b] - nv[a]; });
         var best = sorted[0];
         var m1t = m1P.indexOf(Math.max.apply(null, m1P));
         var frt = frP.indexOf(Math.max.apply(null, frP));
         var gpt = gpP.indexOf(Math.max.apply(null, gpP));
-        var agree = [m1t, frt, gpt].filter(function(v) { return v === best; }).length;
-        var rsiStr = 'Neutral',
-            rsiVal = 50;
+        var f25t = f25.indexOf(Math.max.apply(null, f25));
+        var agree = [m1t, frt, gpt, f25t].filter(function(v) { return v === best; }).length;
+
+        var rsiStr = 'Neutral', rsiVal = 50;
         if (n >= 14) {
-            var rc = digits.slice(-14),
-                g = 0,
-                l = 0;
-            for (var i = 1; i < rc.length; i++) { var dd = rc[i] - rc[i - 1]; if (dd > 0) g += dd;
-                else l += Math.abs(dd); }
+            var rc = digits.slice(-14), g = 0, l = 0;
+            for (var ri = 1; ri < rc.length; ri++) {
+                var dd = rc[ri] - rc[ri - 1];
+                if (dd > 0) g += dd; else l += Math.abs(dd);
+            }
             var rs = l === 0 ? 100 : g / l;
             rsiVal = Math.round(100 - (100 / (1 + rs)));
             if (rsiVal > 70) rsiStr = 'Overbought';
             else if (rsiVal < 30) rsiStr = 'Oversold';
         }
-        var entry = [],
-            exit = [],
-            barrier = null,
-            score = 0,
-            winRate = 0;
+
+        var entry = [], exit = [], barrier = null, score = 0, winRate = 0;
         switch (ct) {
             case 'DIGITOVER':
                 barrier = 1;
@@ -9558,38 +9687,47 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 winRate = 1 - dc[least] / n;
                 break;
             case 'DIGITEVEN':
-                score = [0, 2, 4, 6, 8].reduce(function(a, i) { return a + nv[i]; }, 0);
+                score = [0, 2, 4, 6, 8].reduce(function(a, ix) { return a + nv[ix]; }, 0);
                 entry = [0, 2, 4, 6, 8].sort(function(a, b) { return nv[b] - nv[a]; }).slice(0, 3);
                 exit = entry.slice();
-                winRate = dc.filter(function(_, i) { return i % 2 === 0; }).reduce(function(a, b) { return a + b; },
-                    0) / n;
+                winRate = [0, 2, 4, 6, 8].reduce(function(a, ix) { return a + dc[ix]; }, 0) / n;
                 break;
             case 'DIGITODD':
-                score = [1, 3, 5, 7, 9].reduce(function(a, i) { return a + nv[i]; }, 0);
+                score = [1, 3, 5, 7, 9].reduce(function(a, ix) { return a + nv[ix]; }, 0);
                 entry = [1, 3, 5, 7, 9].sort(function(a, b) { return nv[b] - nv[a]; }).slice(0, 3);
                 exit = entry.slice();
-                winRate = dc.filter(function(_, i) { return i % 2 === 1; }).reduce(function(a, b) { return a + b; },
-                    0) / n;
+                winRate = [1, 3, 5, 7, 9].reduce(function(a, ix) { return a + dc[ix]; }, 0) / n;
                 break;
             case 'RISE_FALL':
-                var rises = 0,
-                    falls = 0;
-                for (var i = 1; i < n; i++) { if (digits[i] > digits[i - 1]) rises++;
-                    else if (digits[i] < digits[i - 1]) falls++; }
-                var tot = rises + falls || 1,
-                    dir = rises >= falls ? 'RISE' : 'FALL';
+                var rises = 0, falls = 0;
+                for (var i2 = 1; i2 < n; i2++) {
+                    if (digits[i2] > digits[i2 - 1]) rises++;
+                    else if (digits[i2] < digits[i2 - 1]) falls++;
+                }
+                var tot = rises + falls || 1;
+                var dir = rises >= falls ? 'RISE' : 'FALL';
                 entry = [dir];
                 exit = [dir];
                 score = Math.abs(rises - falls) / tot;
                 winRate = Math.max(rises, falls) / n;
                 break;
         }
+
+        var patternBoost = 0;
+        if (agree >= 3) patternBoost += 0.04;
+        if (pattern.indexOf('STREAK') === 0 && (ct === 'DIGITMATCH' || ct === 'DIGITDIFF')) patternBoost += 0.03;
+        if (pattern === 'HOT-COLD') patternBoost += 0.02;
+        if (freqSkew > 0.45) patternBoost += 0.02;
+        score = Math.max(0, Math.min(0.99, score + patternBoost));
         var sigStr = score >= 0.72 ? 'STRONG' : score >= 0.60 ? 'MODERATE' : 'WEAK';
-        /* Hit rate of the same contract over only the latest 50 ticks, to show whether the edge is still present. */
+
         var rw = digits.slice(-50), recentRate = 0;
         if (ct === 'RISE_FALL') {
             var rUp = 0, rDn = 0;
-            for (var k = 1; k < rw.length; k++) { if (rw[k] > rw[k - 1]) rUp++; else if (rw[k] < rw[k - 1]) rDn++; }
+            for (var k2 = 1; k2 < rw.length; k2++) {
+                if (rw[k2] > rw[k2 - 1]) rUp++;
+                else if (rw[k2] < rw[k2 - 1]) rDn++;
+            }
             recentRate = (entry[0] === 'RISE' ? rUp : rDn) / Math.max(1, rw.length - 1);
         } else {
             var rHits = rw.filter(function(d) {
@@ -9605,10 +9743,22 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             }).length;
             recentRate = rHits / Math.max(1, rw.length);
         }
-        return { mkt: mkt, ct: ct, entry: entry, exit: exit, barrier: barrier, score: score, winRate: winRate,
-            recentRate: recentRate,
-            sigStr: sigStr, rsiStr: rsiStr, rsiVal: rsiVal, agree: agree, nv: nv };
+
+        var topLive = Array.from({ length: 10 }, function(_, i) { return i; })
+            .sort(function(a, b) { return f25[b] - f25[a]; })
+            .slice(0, 3)
+            .map(function(d) { return d + ':' + Math.round(f25[d] * 100) + '%'; })
+            .join(' ');
+
+        return {
+            mkt: mkt, ct: ct, entry: entry, exit: exit, barrier: barrier,
+            score: score, winRate: winRate, recentRate: recentRate,
+            sigStr: sigStr, rsiStr: rsiStr, rsiVal: rsiVal, agree: agree, nv: nv,
+            pattern: pattern, freqSkew: freqSkew, entropy: entropy,
+            liveFreq: topLive, streak: streak, alternation: alt
+        };
     }
+
 
     function _aisRow(r, rank) {
         var sigCls = r.sigStr === 'STRONG' ? 'aiscan-sig-s' : r.sigStr === 'MODERATE' ? 'aiscan-sig-m' :
@@ -9645,8 +9795,12 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             '<td style="font-family:monospace;font-weight:800;color:#f59e0b">' + barD + '</td>' +
             '<td style="font-size:.62rem;color:' + rsiCol + '">' + r.rsiStr + ' <span style="color:#64748b">(' +
             r.rsiVal + ')</span></td>' +
-            '<td style="color:#a78bfa;font-size:.65rem" title="Number of heuristic components whose top digit agrees">' +
+            '<td style="color:#a78bfa;font-size:.65rem" title="Number of ensemble layers agreeing on top digit">' +
             stars + '</td>' +
+            '<td style="font-size:.6rem;color:#22d3ee;font-weight:700" title="Detected structure in the tick stream">' +
+            (r.pattern || '—') + '</td>' +
+            '<td style="font-size:.58rem;font-family:monospace;color:#94a3b8" title="Instant last-25-tick digit frequencies">' +
+            (r.liveFreq || '—') + '</td>' +
             '<td><button class="aiscan-apply-btn" onclick="aiScanApply(' + rank +
             ')" aria-label="Select ' + r.mkt.name + '" ' + (AIS.active ? 'disabled' : '') +
             '>Select</button></td>';
@@ -11200,7 +11354,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         <div class="aiscan-hdr">
             <div>
                 <h3>✦ Market Scanner</h3>
-                <div id="aiscan-sub" class="aiscan-sub">Configure a scan of recent market history</div>
+                <div id="aiscan-sub" class="aiscan-sub">Neural Market Scan — real Deriv ticks · live frequency · patterns</div>
             </div>
             <button class="btn ghost sm" id="aiscan-close" aria-label="Close scanner">&#x2715;</button>
         </div>
@@ -11213,7 +11367,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     <select class="inp" id="aiscan-ticks">
                         <option value="200">200 ticks</option>
                         <option value="500">500 ticks</option>
-                        <option value="1000">1,000 ticks</option>
+                        <option value="1000" selected>1,000 ticks (recommended)</option>
+                        <option value="2000">2,000 ticks</option>
+                        <option value="5000">5,000 ticks (deep)</option>
                     </select>
                 </label>
             </div>
@@ -11231,7 +11387,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 </div>
             </div>
             <div class="aiscan-note">
-                This scanner ranks recent tick statistics; its score is not a probability or promise of future results.
+                Neural scanner pulls real Deriv historical ticks, runs multi-layer frequency & pattern analysis, and ranks markets relatively — not a promise of future results.
                 Stake, recovery and risk settings (stop loss, take profit, max trades) stay in the bot panel.
                 Scanning never places a trade unless Auto-execute below is switched on.
             </div>
@@ -11257,7 +11413,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             </div>
             <div class="aiscan-setup-footer">
                 <button class="btn ghost sm" id="aiscan-setup-cancel">Cancel</button>
-                <button class="btn sm" id="aiscan-start">✦ Scan markets</button>
+                <button class="btn sm" id="aiscan-start">⚡ Neural Scan</button>
             </div>
         </div>
         <div id="aiscan-results-view" class="aiscan-results-view" style="display:none;">
@@ -11269,7 +11425,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 <div class="aiscan-prog-bar"><div class="aiscan-prog-fill" id="aiscan-prog-fill" style="width:0%"></div></div>
             </div>
             <div class="aiscan-result-note">
-                Relative heuristic ranking from recent ticks—not calibrated confidence or a forecast. Sample hit rate describes this sample only.
+                Neural ensemble ranking from real Deriv ticks_history (frequency · Markov · gaps · live windows · patterns). Relative score only — not a probability of future results.
             </div>
             <div class="aiscan-result-scroll">
                 <div id="aiscan-ph" class="aiscan-ph">
@@ -11277,7 +11433,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     Ready to collect tick samples…
                 </div>
                 <table class="aiscan-tbl" id="aiscan-table" style="display:none;">
-                    <thead><tr><th>Rank</th><th>Market</th><th>Signal</th><th>Relative score</th><th>Sample hit rate</th><th title="Hit rate over the most recent 50 ticks">Last 50</th><th>Ticks</th><th>Entry</th><th>Exit</th><th>Barrier</th><th>RSI</th><th>Agreement</th><th></th></tr></thead>
+                    <thead><tr><th>Rank</th><th>Market</th><th>Signal</th><th>Relative score</th><th>Sample hit rate</th><th title="Hit rate over the most recent 50 ticks">Last 50</th><th>Ticks</th><th>Entry</th><th>Exit</th><th>Barrier</th><th>RSI</th><th>Agreement</th><th>Pattern</th><th title="Last 25-tick live frequencies">Live freq</th><th></th></tr></thead>
                     <tbody id="aiscan-tbody"></tbody>
                 </table>
             </div>
