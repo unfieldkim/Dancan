@@ -7300,6 +7300,30 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         S.reconnecting = false;
     }
 
+    function restoreConnectionSubscriptions(ws, mkt) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        var requests = [
+            { ticks: mkt, subscribe: 1 },
+            { balance: 1, subscribe: 1 },
+            { active_symbols: 'brief' }
+        ];
+        if (S.botActive && S.activeContractId) {
+            requests.push({
+                proposal_open_contract: 1,
+                contract_id: S.activeContractId,
+                subscribe: 1
+            });
+        }
+        requests.forEach(function(request) {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            try {
+                ws.send(JSON.stringify(request));
+            } catch (e) {
+                doLog('⚠️ Failed to restore a connection subscription: ' + e.message, 'warn');
+            }
+        });
+    }
+
     /* ── Enhanced openWS (supports OTP-authed URLs) ── */
     function openWS(token, mkt, wsUrlOverride) {
         S.connecting = true;
@@ -7365,6 +7389,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             return;
         }
         S.ws = ws;
+        var retryAfterClose = false;
 
         var authTimeout = setTimeout(function() {
             if (S.ws === ws && ws.readyState === 1) {
@@ -7372,11 +7397,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 S.connDiag.lastErrorReason = 'Auth timeout (12s no response)';
                 S.connDiag.lastErrorTime = Date.now();
                 S.closeIntended = true;
+                retryAfterClose = true;
                 try { ws.close(4000, 'auth timeout'); } catch (e) {}
                 showAuthError('Authentication Timeout',
                     'The server did not respond to your token within 12 seconds. Check your network or try a different endpoint.',
                     'network');
-                circuitBreakerRecordFailure();
             }
         }, 12000);
 
@@ -7390,22 +7415,24 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 S.connDiag.lastErrorTime = Date.now();
                 S.connDiag.failedConnections++;
                 S.closeIntended = true;
+                retryAfterClose = true;
                 try { ws.close(4001, 'connection timeout'); } catch (e) {}
                 S.connecting = false;
                 showAuthError('Connection Timeout',
                     'Failed to establish WebSocket connection in 15 seconds. Check your network and firewall.',
                     'network');
-                circuitBreakerRecordFailure();
-                schedRecon(token, mkt);
             }
         }, 15000);
 
         ws.onopen = function() {
+            if (S.ws !== ws) return;
             clearTimeout(authTimeout);
             clearTimeout(connTimeout);
             S.recon = 0;
             S.reconnectAttempts = 0;
             S.rapidCloseCount = 0;
+            S.closeIntended = false;
+            S.wsTerminated = false;
             hideBanner();
             S.connecting = false;
             S.reconnecting = false;
@@ -7423,10 +7450,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 if (preAuthed) {
                     doLog('✅ Socket open — using OTP-authed URL (no authorize needed)', 'info');
                     clearTimeout(authTimeout);
-                    // Subscribe immediately; server will emit balance/ticks
-                    try { ws.send(JSON.stringify({ ticks: mkt, subscribe: 1 })); } catch(_){}
-                    try { ws.send(JSON.stringify({ balance: 1, subscribe: 1 })); } catch(_){}
-                    try { ws.send(JSON.stringify({ active_symbols: 'brief' })); } catch(_){} // FIXED: Invalid Symbol List — live cross-check, see pruneInvalidMarkets()
+                    restoreConnectionSubscriptions(ws, mkt);
                     setConn('on');
                     S.authState.isAuthenticated = true;
                     /* FIXED: Stale "Not connected" display under the new OTP flow —
@@ -7467,6 +7491,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         };
 
         ws.onmessage = function(e) {
+            if (S.ws !== ws) return;
             if (e.data === '{"msg_type":"pong"}') { S.pongReceived = true;
                 S.lastMessageReceived = Date.now(); return; }
             if (typeof e.data === 'string' && e.data.startsWith('{"msg_type":"ping"')) {
@@ -7612,13 +7637,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     notify('✅ Connected as ' + d.authorize.loginid, 'ok');
                     doLog('Auth OK → subscribing ' + mkt, 'info');
 
-                    try {
-                        ws.send(JSON.stringify({ ticks: mkt, subscribe: 1 }));
-                        ws.send(JSON.stringify({ balance: 1, subscribe: 1 }));
-                        ws.send(JSON.stringify({ active_symbols: 'brief' })); // FIXED: Invalid Symbol List — live cross-check, see pruneInvalidMarkets()
-                    } catch (e) {
-                        doLog('⚠️ Failed to subscribe: ' + e.message, 'warn');
-                    }
+                    restoreConnectionSubscriptions(ws, mkt);
 
                     document.getElementById('btn-start').disabled = false;
                     document.getElementById('bot-conn-status').textContent = 'Connected as ' + d.authorize.loginid;
@@ -7720,6 +7739,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         };
 
         ws.onerror = function(ev) {
+            if (S.ws !== ws) return;
             var now = Date.now();
 
             // Browsers give NO detail in WebSocket ErrorEvent — all we know is it failed.
@@ -7768,9 +7788,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         };
 
         ws.onclose = function(ev) {
+            if (S.ws !== ws) return;
             clearTimeout(authTimeout);
             clearTimeout(connTimeout);
             clearReconnectTimers();
+            S.ws = null;
             S.connecting = false;
             setConn('err');
             var closeInfo = _wsCloseCategory(ev.code);
@@ -7787,6 +7809,21 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             document.getElementById('bot-conn-status').textContent = 'Disconnected';
             document.getElementById('bot-conn-status').className = 'disconnected';
             _updateDiagTooltip();
+
+            if (retryAfterClose) {
+                retryAfterClose = false;
+                S.closeIntended = false;
+                S.wsTerminated = false;
+                if (!navigator.onLine) {
+                    S.reconnectPending = true;
+                    doLog('📡 Offline during connection timeout — waiting for network…', 'warn');
+                    showBanner('Internet lost. Auto-reconnect when back online.', 'warn');
+                } else if (S.tokenMkt && !S.fatalAuthError) {
+                    circuitBreakerRecordFailure();
+                    schedRecon(S.tokenMkt.token, S.tokenMkt.mkt);
+                }
+                return;
+            }
 
             // Show auth error if it was auth-related
             if (closeInfo.cat === 'auth') {
@@ -8047,10 +8084,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     doLog('🩺 Health check found stale socket (state: ' + (stateMap[rs] || rs) +
                         ') — reconnecting', 'warn');
                     S.connDiag.lastErrorReason = 'Health check: socket in state ' + (stateMap[rs] || rs);
-                    S.wsTerminated = true;
-                    try { S.ws.close(); } catch (e) {}
-                    S.ws = null;
-                    if (S.tokenMkt) schedRecon(S.tokenMkt.token, S.tokenMkt.mkt);
+                    forceReconnect();
                 }
                 return;
             }
@@ -8089,6 +8123,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         S.epIdx = (S.epIdx + 1) % S.eps.length;
         S.connecting = false;
         S.reconnecting = false;
+        S.closeIntended = false;
+        S.wsTerminated = false;
         S.connDiag.stabilityScore = Math.max(0, S.connDiag.stabilityScore - 3);
         connectWithFreshOTP(token, mkt); // FIXED: API Architecture Migration — fresh OTP per reconnect, OTPs expire ~120s
     }
