@@ -4432,6 +4432,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                             <select class="bot-inp" id="b-contract" style="margin-bottom:0;flex:1;">
                                 <option value="DIGITOVER">Digit Over</option>
                                 <option value="DIGITUNDER">Digit Under</option>
+                                <option value="OVER2_UNDER7">Over 2 + Under 7 (Dual)</option>
                                 <option value="DIGITMATCH">Digit Match</option>
                                 <option value="DIGITDIFF">Digit Different</option>
                                 <option value="DIGITEVEN">Digit Even</option>
@@ -4851,12 +4852,82 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 <script>
     'use strict';
     /* ════════════════════════════════════════
+       SAFE STORAGE SHIM
+       Prevents SecurityError when the page is sandboxed
+       (no allow-same-origin) or storage is otherwise blocked.
+       Falls back to an in-memory store so the rest of the app
+       can keep calling localStorage / sessionStorage as usual.
+    ════════════════════════════════════════ */
+    (function () {
+        function makeMemoryStore() {
+            var data = Object.create(null);
+            return {
+                getItem: function (k) { return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; },
+                setItem: function (k, v) { data[String(k)] = String(v); },
+                removeItem: function (k) { delete data[k]; },
+                clear: function () { data = Object.create(null); },
+                key: function (i) { return Object.keys(data)[i] || null; },
+                get length() { return Object.keys(data).length; }
+            };
+        }
+        function isStorageUsable(store) {
+            if (!store) return false;
+            try {
+                var t = '__ss_test__';
+                store.setItem(t, '1');
+                store.removeItem(t);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+        try {
+            if (!isStorageUsable(window.localStorage)) {
+                Object.defineProperty(window, 'localStorage', {
+                    value: makeMemoryStore(),
+                    configurable: true,
+                    writable: true
+                });
+            }
+        } catch (e) {
+            try {
+                Object.defineProperty(window, 'localStorage', {
+                    value: makeMemoryStore(),
+                    configurable: true,
+                    writable: true
+                });
+            } catch (e2) { /* ignore */ }
+        }
+        try {
+            if (!isStorageUsable(window.sessionStorage)) {
+                Object.defineProperty(window, 'sessionStorage', {
+                    value: makeMemoryStore(),
+                    configurable: true,
+                    writable: true
+                });
+            }
+        } catch (e) {
+            try {
+                Object.defineProperty(window, 'sessionStorage', {
+                    value: makeMemoryStore(),
+                    configurable: true,
+                    writable: true
+                });
+            } catch (e2) { /* ignore */ }
+        }
+    })();
+
+    /* ════════════════════════════════════════
        USER MANAGER (kept for settings persistence)
     ════════════════════════════════════════ */
     class UserManager {
         constructor() {
-            this.users = JSON.parse(localStorage.getItem('tradingBotUsers')) || {};
-            this.currentUser = localStorage.getItem('tradingBotCurrentUser');
+            try {
+                this.users = JSON.parse(localStorage.getItem('tradingBotUsers') || '{}') || {};
+            } catch (e) { this.users = {}; }
+            try {
+                this.currentUser = localStorage.getItem('tradingBotCurrentUser');
+            } catch (e) { this.currentUser = null; }
         }
         async hashPassword(p) {
             const d = new TextEncoder().encode(p);
@@ -4889,7 +4960,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                     maxTrades: 0
                 }
             };
-            localStorage.setItem('tradingBotUsers', JSON.stringify(this.users));
+            try { localStorage.setItem('tradingBotUsers', JSON.stringify(this.users)); } catch (e) {}
             return { success: true, message: 'Registration successful! Please login' };
         }
         async login(u, p) {
@@ -4898,17 +4969,17 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             const hp = await this.hashPassword(p);
             if (this.users[u].password !== hp) return { success: false, message: 'Incorrect password' };
             this.currentUser = u;
-            localStorage.setItem('tradingBotCurrentUser', u);
+            try { localStorage.setItem('tradingBotCurrentUser', u); } catch (e) {}
             return { success: true };
         }
         logout() { this.saveData();
             this.currentUser = null;
-            localStorage.removeItem('tradingBotCurrentUser'); }
+            try { localStorage.removeItem('tradingBotCurrentUser'); } catch (e) {} }
         saveData() {
             if (!this.currentUser) return;
             const t = document.getElementById('api-token');
             if (t) this.users[this.currentUser].token = t.value;
-            localStorage.setItem('tradingBotUsers', JSON.stringify(this.users));
+            try { localStorage.setItem('tradingBotUsers', JSON.stringify(this.users)); } catch (e) {}
         }
         loadSettings() {
             if (!this.currentUser || !this.users[this.currentUser]) return;
@@ -4984,6 +5055,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         botStats: { tradesPlaced: 0, wins: 0, losses: 0, profitLoss: 0, consecWins: 0, consecLosses: 0, totalWon: 0,
             totalLost: 0 },
         activeContractId: null,
+        activeDualIds: null,
+        dualSettled: null,
+        dualCombinedProfit: 0,
+        buyPayloadCacheStr: '',
+        dualPayloadCache: null,
         contractSubId: null,
         isPlacingTrade: false,
         initialEntryMet: false,
@@ -5089,21 +5165,22 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
     /* ── PAT Helpers ── */
     function getStoredPAT() {
-        return sessionStorage.getItem('deriv_pat') || localStorage.getItem('deriv_pat') || '';
+        try {
+            return sessionStorage.getItem('deriv_pat') || localStorage.getItem('deriv_pat') || '';
+        } catch (e) { return ''; }
     }
 
     function clearPAT() {
-        sessionStorage.removeItem('deriv_pat');
-        localStorage.removeItem('deriv_pat');
+        try { sessionStorage.removeItem('deriv_pat'); } catch (e) {}
+        try { localStorage.removeItem('deriv_pat'); } catch (e) {}
     }
 
     function savePAT(token, remember) {
-        sessionStorage.setItem('deriv_pat', token);
-        if (remember) {
-            localStorage.setItem('deriv_pat', token);
-        } else {
-            localStorage.removeItem('deriv_pat');
-        }
+        try { sessionStorage.setItem('deriv_pat', token); } catch (e) {}
+        try {
+            if (remember) localStorage.setItem('deriv_pat', token);
+            else localStorage.removeItem('deriv_pat');
+        } catch (e) {}
     }
 
     /* ── Preferred Account Persistence ──────────────────────────────────────
@@ -5721,13 +5798,26 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     function updateRiseFallFieldLabels() {
         const ct = document.getElementById('b-contract').value;
         const isRF = ct === 'RISE_FALL';
+        const isDual = ct === 'OVER2_UNDER7';
         document.getElementById('b-entry-label').textContent = isRF ? 'Rise/Fall Direction (RISE or FALL)' :
         'Entry Digits (comma separated)';
         document.getElementById('b-exit-label').textContent = isRF ? 'Wait Exit Direction (RISE or FALL)' :
         'Wait Exit Digits (comma separated)';
-        document.getElementById('b-barrier-label').textContent = isRF ? 'Barrier (N/A for Rise/Fall)' : 'Barrier (0–9)';
+        document.getElementById('b-barrier-label').textContent = isRF ? 'Barrier (N/A for Rise/Fall)' :
+            (isDual ? 'Barriers (fixed: Over 2 + Under 7)' : 'Barrier (0–9)');
         document.getElementById('b-entry').placeholder = isRF ? 'RISE' : '0,1';
         document.getElementById('b-exit').placeholder = isRF ? 'RISE' : '0,1';
+        var barEl = document.getElementById('b-barrier');
+        if (barEl) {
+            if (isDual) {
+                barEl.value = 2;
+                barEl.disabled = true;
+                barEl.title = 'Fixed dual barriers: Digit Over 2 and Digit Under 7';
+            } else {
+                var icocOn = document.getElementById('b-icoc-mode') && document.getElementById('b-icoc-mode').checked;
+                if (!icocOn) { barEl.disabled = false; barEl.title = ''; }
+            }
+        }
     }
 
     /* ════════════════════════════════════════
@@ -6645,7 +6735,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         /* ⚡ TURBO HOT PATH — evaluate entry & fire the buy BEFORE matrix/UI work
            so the WebSocket frame leaves the browser on the same event-loop turn
            the tick arrived. Full botProcessTick still runs later for status text. */
-        if (S.botActive && S.turboMode && S.tradingConfig && !S.activeContractId && !S.isPlacingTrade) {
+        if (S.botActive && S.turboMode && S.tradingConfig && !S.activeContractId && !(S.activeDualIds && S.activeDualIds.size) && !S.isPlacingTrade) {
             S.lastTick = { quote: price, digit: digit, ts: performance.now() };
             S.lastMessageReceived = Date.now();
             botTryFireEntryFast(digit);
@@ -8522,6 +8612,17 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             .filter(function(d) { return !isNaN(d) && d >= 0 && d <= 9; });
         if (!ed.length) { notify('Invalid entry digits', 'err'); return null; }
         if (!xd.length) { notify('Invalid exit digits', 'err'); return null; }
+        if (ct === 'OVER2_UNDER7') {
+            return {
+                symbol: document.getElementById('mkt').value,
+                contractType: ct,
+                entryDigits: ed,
+                waitExitDigits: xd,
+                barrier: 2,
+                dualBarriers: [2, 7],
+                isDual: true
+            };
+        }
         var barrier = parseInt(document.getElementById('b-barrier').value);
         if (isNaN(barrier) || barrier < 0 || barrier > 9) { notify('Barrier must be 0–9', 'err'); return null; }
         return { symbol: document.getElementById('mkt').value, contractType: ct, entryDigits: ed,
@@ -8607,19 +8708,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
        Goal: minimize work between "tick digit matches entry" and ws.send(buy).
        Network RTT to Deriv still dominates absolute latency; this removes
        client-side stalls (UI, stringify from scratch, deferred status text). */
-    function botRebuildBuyPayloadCache() {
-        if (!S.tradingConfig || !S.ws) { S.buyPayloadCache = null; S.buyPayloadCacheKey = ''; return; }
-        var isRF = S.tradingConfig.contractType === 'RISE_FALL';
-        var apiContractType = S.tradingConfig.contractType;
-        var barrier = S.tradingConfig.barrier;
-        if (isRF) {
-            var direction = S.tradingConfig.entryDigits[0] === 'FALL' ? 'FALL' : 'RISE';
-            apiContractType = direction === 'FALL' ? 'PUT' : 'CALL';
-            barrier = undefined;
-        } else if (S.tradingConfig.contractType === 'DIGITEVEN' || S.tradingConfig.contractType === 'DIGITODD') {
-            barrier = undefined;
-        }
-        var stake = S.currentStake || S.initStake || 1;
+    function botBuildDigitBuyParams(apiContractType, barrier, stake) {
         var params = {
             buy: '1',
             price: stake,
@@ -8636,14 +8725,78 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         if (barrier !== undefined && barrier !== null && barrier !== '') {
             params.parameters.barrier = String(barrier);
         }
+        return params;
+    }
+
+    function botRebuildBuyPayloadCache() {
+        if (!S.tradingConfig || !S.ws) {
+            S.buyPayloadCache = null; S.buyPayloadCacheKey = ''; S.buyPayloadCacheStr = '';
+            S.dualPayloadCache = null;
+            return;
+        }
+        var stake = S.currentStake || S.initStake || 1;
+        var sym = S.tradingConfig.symbol;
+        var dur = S.tradeDuration;
+
+        /* Dual: pre-build + pre-stringify both legs so send path is two ws.send() only */
+        if (S.tradingConfig.contractType === 'OVER2_UNDER7') {
+            var pOver = botBuildDigitBuyParams('DIGITOVER', 2, stake);
+            var pUnder = botBuildDigitBuyParams('DIGITUNDER', 7, stake);
+            S.dualPayloadCache = {
+                stake: stake,
+                over: pOver,
+                under: pUnder,
+                overStr: JSON.stringify(pOver),
+                underStr: JSON.stringify(pUnder),
+                key: ['OVER2_UNDER7', sym, dur, stake].join('|')
+            };
+            S.buyPayloadCache = null;
+            S.buyPayloadCacheKey = '';
+            S.buyPayloadCacheStr = '';
+            return;
+        }
+
+        var isRF = S.tradingConfig.contractType === 'RISE_FALL';
+        var apiContractType = S.tradingConfig.contractType;
+        var barrier = S.tradingConfig.barrier;
+        if (isRF) {
+            var direction = S.tradingConfig.entryDigits[0] === 'FALL' ? 'FALL' : 'RISE';
+            apiContractType = direction === 'FALL' ? 'PUT' : 'CALL';
+            barrier = undefined;
+        } else if (S.tradingConfig.contractType === 'DIGITEVEN' || S.tradingConfig.contractType === 'DIGITODD') {
+            barrier = undefined;
+        }
+        var params = botBuildDigitBuyParams(apiContractType, barrier, stake);
         S.buyPayloadCache = params;
-        S.buyPayloadCacheKey = [apiContractType, S.tradingConfig.symbol, S.tradeDuration, barrier, stake].join('|');
+        S.buyPayloadCacheKey = [apiContractType, sym, dur, barrier, stake].join('|');
+        S.buyPayloadCacheStr = JSON.stringify(params);
+        S.dualPayloadCache = null;
     }
 
     function botPatchBuyStake(params, stake) {
         params.price = stake;
         params.parameters.amount = stake;
         return params;
+    }
+
+    /** Stale-socket guard: if no message for STALE_MS, soft-reconnect before buying. */
+    var BOT_STALE_MS = 8000;
+    function botConnLooksStale() {
+        if (!S.lastMessageReceived) return true;
+        return (Date.now() - S.lastMessageReceived) > BOT_STALE_MS;
+    }
+    function botEnsureFreshConnForTrade() {
+        if (!S.ws || S.ws.readyState !== 1) return false;
+        if (!botConnLooksStale()) return true;
+        // Soft ping first — if the socket is alive this refreshes lastMessageReceived soon.
+        try { S.ws.send(JSON.stringify({ ping: 1 })); } catch (e) {}
+        // If still very stale (>20s), force reconnect rather than send a buy into the void.
+        if ((Date.now() - (S.lastMessageReceived || 0)) > 20000) {
+            botAddLog('⚠️ Connection silent >20s — forcing reconnect before trade');
+            try { if (typeof forceReconnect === 'function') forceReconnect(); } catch (e) {}
+            return false;
+        }
+        return true; // mildly stale but still open — allow trade, gap will be logged
     }
 
     /** Lightweight entry test used on the turbo hot path (no DOM writes). */
@@ -8661,7 +8814,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
     /** Fire trade on the same tick turn if entry is met. Returns true if a buy was sent. */
     function botTryFireEntryFast(digit) {
-        if (!S.botActive || S.isPlacingTrade || S.activeContractId) return false;
+        if (!S.botActive || S.isPlacingTrade || S.activeContractId || (S.activeDualIds && S.activeDualIds.size)) return false;
         if (!S.tradingConfig) return false;
         if (!botCheckRisk()) return false;
         if (!S.directEntry && !botShouldTradeNow()) return false;
@@ -8700,6 +8853,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
     function botExecuteTrade() {
         if (S.isPlacingTrade || !botCheckRisk() || !S.tradingConfig) return;
+        if (S.activeContractId || (S.activeDualIds && S.activeDualIds.size)) return;
         if (!S.directEntry && !botShouldTradeNow()) {
             var threshold = document.getElementById('b-signal-threshold').value;
             document.getElementById('bot-trade-status').textContent = '⏳ Gate: waiting for ' + threshold +
@@ -8708,14 +8862,77 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         }
         if (!S.ws || S.ws.readyState !== 1) { notify('Connection lost', 'err');
             botStop(); return; }
+        if (typeof botEnsureFreshConnForTrade === 'function' && !botEnsureFreshConnForTrade()) {
+            document.getElementById('bot-trade-status').textContent = '⏳ Refreshing connection before trade…';
+            return;
+        }
         S.isPlacingTrade = true;
         S.tradeRequestStartTime = performance.now();
-        // Snapshot how long it's been since ANY message arrived, right at send
-        // time — this tells us, after the fact, whether a slow trade happened
-        // on a connection that already looked stale vs. one that was fresh.
         S.tradeSendGapMs = S.lastMessageReceived ? (Date.now() - S.lastMessageReceived) : 0;
         S.lastTradeStake = (S.botStats.tradesPlaced === 0) ? S.initStake : S.currentStake;
         S.tradeStartTickIndex = S.digits.length;
+
+        /* Dual Over 2 + Under 7 — pre-stringified legs; copy deferred off hot path */
+        if (S.tradingConfig.contractType === 'OVER2_UNDER7') {
+            var dualKey = ['OVER2_UNDER7', S.tradingConfig.symbol, S.tradeDuration, S.lastTradeStake].join('|');
+            var dcache = S.dualPayloadCache;
+            var overStr, underStr, overParams, underParams;
+            if (dcache && dcache.key === dualKey) {
+                overStr = dcache.overStr; underStr = dcache.underStr;
+                overParams = dcache.over; underParams = dcache.under;
+            } else {
+                overParams = botBuildDigitBuyParams('DIGITOVER', 2, S.lastTradeStake);
+                underParams = botBuildDigitBuyParams('DIGITUNDER', 7, S.lastTradeStake);
+                overStr = JSON.stringify(overParams);
+                underStr = JSON.stringify(underParams);
+                S.dualPayloadCache = {
+                    stake: S.lastTradeStake, over: overParams, under: underParams,
+                    overStr: overStr, underStr: underStr, key: dualKey
+                };
+            }
+            S.activeDualIds = new Set();
+            S.dualSettled = {};
+            S.dualCombinedProfit = 0;
+            S.dualExpected = 2;
+            S.dualReceived = 0;
+            try {
+                S.ws.send(overStr);
+                S.ws.send(underStr);
+            } catch (sendErr) {
+                S.isPlacingTrade = false;
+                S.activeDualIds = null;
+                notify('Dual buy send failed: ' + (sendErr.message || sendErr), 'err');
+                return;
+            }
+            voidMicrotask(function() {
+                try { cpReplicateTrade(overParams); } catch (e) {}
+                try { cpReplicateTrade(underParams); } catch (e) {}
+                var statusEl = document.getElementById('bot-trade-status');
+                if (statusEl) {
+                    statusEl.textContent = (S.turboMode ? '⚡ ' : '') + 'Placing dual Over2+Under7 · $' +
+                        S.lastTradeStake.toFixed(2) + ' each…';
+                }
+                botAddLog('DUAL PLACE — Over 2 + Under 7 · $' + S.lastTradeStake.toFixed(2) + ' each');
+            });
+            clearBuyWatchdog();
+            S.buyWatchdogWarnTimer = setTimeout(function() {
+                if (!S.isPlacingTrade) return;
+                var waited = Math.round((performance.now() - S.tradeRequestStartTime) / 1000);
+                doLog('⏳ Dual buy taking unusually long (' + waited + 's so far)…', 'warn');
+            }, 6000);
+            S.buyWatchdogFailTimer = setTimeout(function() {
+                if (!S.isPlacingTrade) return;
+                var waited = Math.round((performance.now() - S.tradeRequestStartTime) / 1000);
+                S.isPlacingTrade = false;
+                document.getElementById('bot-trade-status').textContent =
+                    'Dual buy unanswered after ' + waited + 's — check portfolio';
+                botAddLog('Dual buy unanswered after ' + waited + 's — bot stopped for safety');
+                notify('⚠️ Dual trade unanswered after ' + waited + 's — bot stopped.', 'err');
+                botStop();
+            }, 20000);
+            return;
+        }
+
         var isRF = S.tradingConfig.contractType === 'RISE_FALL';
         var apiContractType = S.tradingConfig.contractType;
         var barrier = S.tradingConfig.barrier;
@@ -8727,34 +8944,27 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         } else if (S.tradingConfig.contractType === 'DIGITEVEN' || S.tradingConfig.contractType === 'DIGITODD') {
             barrier = undefined;
         }
-        /* FIXED: Buy Request Schema — underlying_symbol + string barrier/buy.
-           TURBO: reuse a cached payload object when contract shape is unchanged;
-           only patch stake, then stringify + send IMMEDIATELY before any DOM work. */
         var params;
+        var sendStr;
         var cacheKey = [apiContractType, S.tradingConfig.symbol, S.tradeDuration, barrier, S.lastTradeStake].join('|');
-        if (S.buyPayloadCache && S.buyPayloadCacheKey === cacheKey) {
+        if (S.buyPayloadCache && S.buyPayloadCacheKey === cacheKey && S.buyPayloadCacheStr) {
             params = S.buyPayloadCache;
-            botPatchBuyStake(params, S.lastTradeStake);
+            sendStr = S.buyPayloadCacheStr;
         } else {
-            params = { buy: '1', price: S.lastTradeStake, parameters: { amount: S.lastTradeStake, basis: 'stake',
-                    contract_type: apiContractType, currency: 'USD', duration: S.tradeDuration, duration_unit: 't',
-                    underlying_symbol: S.tradingConfig.symbol } };
-            if (barrier !== undefined && barrier !== null && barrier !== '') {
-                params.parameters.barrier = String(barrier);
-            }
+            params = botBuildDigitBuyParams(apiContractType, barrier, S.lastTradeStake);
+            sendStr = JSON.stringify(params);
             S.buyPayloadCache = params;
             S.buyPayloadCacheKey = cacheKey;
+            S.buyPayloadCacheStr = sendStr;
         }
-        // SEND FIRST — every millisecond after entry detection counts on tick charts
         try {
-            S.ws.send(JSON.stringify(params));
+            S.ws.send(sendStr);
         } catch (sendErr) {
             S.isPlacingTrade = false;
             notify('Buy send failed: ' + (sendErr.message || sendErr), 'err');
             return;
         }
-        // Non-critical work after the frame is on the wire
-        queueMicrotask(function() {
+        voidMicrotask(function() {
             try { cpReplicateTrade(params); } catch (e) {}
             var statusEl = document.getElementById('bot-trade-status');
             if (statusEl) {
@@ -8785,6 +8995,47 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     }
 
     function botHandleBuyResponse(data) {
+        if (S.tradingConfig && S.tradingConfig.contractType === 'OVER2_UNDER7' && S.activeDualIds) {
+            if (data.buy && data.buy.contract_id) {
+                var cid = String(data.buy.contract_id);
+                S.activeDualIds.add(cid);
+                S.dualReceived = (S.dualReceived || 0) + 1;
+                botAddLog('DUAL leg open — #' + cid + ' · stake $' + S.lastTradeStake.toFixed(2));
+                if (S.ws && S.ws.readyState === 1) {
+                    try {
+                        S.ws.send(JSON.stringify({
+                            proposal_open_contract: 1,
+                            contract_id: data.buy.contract_id,
+                            subscribe: 1
+                        }));
+                    } catch (e) {}
+                }
+                document.getElementById('bot-trade-status').textContent =
+                    'Dual open: ' + S.activeDualIds.size + '/2 contracts — awaiting settlement';
+                if (S.dualReceived >= (S.dualExpected || 2)) {
+                    S.isPlacingTrade = false;
+                    clearBuyWatchdog();
+                    S.activeContractId = 'DUAL';
+                    botAddLog('DUAL both legs open — waiting for settlements');
+                }
+                return;
+            }
+            if (data.error) {
+                botAddLog('Dual leg error: ' + data.error.message);
+                S.dualReceived = (S.dualReceived || 0) + 1;
+                if (S.dualReceived >= (S.dualExpected || 2) || S.activeDualIds.size === 0) {
+                    S.isPlacingTrade = false;
+                    clearBuyWatchdog();
+                    if (S.activeDualIds.size === 0) {
+                        S.activeDualIds = null;
+                        document.getElementById('bot-trade-status').textContent = 'Dual failed: ' + data.error.message;
+                        if (S.botActive && S.initialEntryMet) setTimeout(botExecuteTrade, S.turboMode ? 50 : 200);
+                    }
+                }
+                return;
+            }
+        }
+
         S.isPlacingTrade = false;
         clearBuyWatchdog();
         if (data.buy && data.buy.contract_id) {
@@ -8817,16 +9068,88 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         } else if (data.error) {
             document.getElementById('bot-trade-status').textContent = 'Error: ' + data.error.message;
             botAddLog('Trade error: ' + data.error.message);
-            if (S.botActive && S.initialEntryMet) setTimeout(botExecuteTrade, 200);
+            if (S.botActive && S.initialEntryMet) setTimeout(botExecuteTrade, S.turboMode ? 50 : 200);
         }
     }
 
     function botHandleContractUpdate(poc) {
-        if (!poc || !S.botActive || !S.activeContractId) return;
-        if (String(poc.contract_id) !== String(S.activeContractId)) return;
-        if (poc.id) S.contractSubId = poc.id;
+        if (!poc || !S.botActive) return;
         var isSettled = poc.status === 'won' || poc.status === 'lost' || poc.is_sold === 1;
         if (!isSettled) return;
+
+        if (S.activeDualIds && S.activeDualIds.size && S.activeDualIds.has(String(poc.contract_id))) {
+            if (poc.id && S.ws && S.ws.readyState === 1) {
+                try { S.ws.send(JSON.stringify({ forget: poc.id })); } catch (e) {}
+            }
+            var dProfit = parseFloat(poc.profit) || 0;
+            var dWin = poc.status === 'won';
+            S.dualSettled = S.dualSettled || {};
+            if (S.dualSettled[String(poc.contract_id)]) return;
+            S.dualSettled[String(poc.contract_id)] = { profit: dProfit, win: dWin };
+            S.dualCombinedProfit = +(S.dualCombinedProfit + dProfit).toFixed(2);
+            botAddLog('DUAL leg settled #' + poc.contract_id + ': ' +
+                (dWin ? 'WIN' : 'LOSS') + ' ' + (dProfit >= 0 ? '+' : '') + dProfit.toFixed(2));
+            var settledCount = Object.keys(S.dualSettled).length;
+            document.getElementById('bot-trade-status').textContent =
+                'Dual settling ' + settledCount + '/' + S.activeDualIds.size +
+                ' · combined ' + (S.dualCombinedProfit >= 0 ? '+' : '') + S.dualCombinedProfit.toFixed(2);
+            if (settledCount >= S.activeDualIds.size) {
+                var pairWin = S.dualCombinedProfit > 0;
+                var exitDigit = S.lastTick ? S.lastTick.digit : '—';
+                S.botStats.tradesPlaced += 2;
+                S.botStats.profitLoss = +(S.botStats.profitLoss + S.dualCombinedProfit).toFixed(2);
+                if (pairWin) {
+                    S.botStats.wins += 2;
+                    S.botStats.totalWon = +((S.botStats.totalWon || 0) + S.dualCombinedProfit).toFixed(2);
+                    S.botStats.consecWins++;
+                    S.botStats.consecLosses = 0;
+                } else {
+                    S.botStats.losses += 2;
+                    S.botStats.totalLost = +((S.botStats.totalLost || 0) + Math.abs(S.dualCombinedProfit)).toFixed(2);
+                    S.botStats.consecLosses++;
+                    S.botStats.consecWins = 0;
+                }
+                var res = pairWin ? 'WIN' : 'LOSS';
+                var dispProfit = (S.dualCombinedProfit >= 0 ? '+$' : '-$') + Math.abs(S.dualCombinedProfit).toFixed(2);
+                document.getElementById('bot-trade-status').textContent =
+                    'DUAL Over2+Under7 ' + res + ': ' + dispProfit + ' | Digit:' + exitDigit;
+                botAddLog('DUAL PAIR ' + res + ': ' + dispProfit + ' (2 legs) | Digit:' + exitDigit);
+                botPlaySound(pairWin ? 'win' : 'loss');
+                botUpdateStatsUI();
+                botUpdateChart(S.dualCombinedProfit);
+                S.lastTradeWasLoss = !pairWin;
+                S.activeContractId = null;
+                S.activeDualIds = null;
+                S.dualSettled = null;
+                S.dualCombinedProfit = 0;
+                if (!pairWin) {
+                    S.recoveryActive = true;
+                    var next = S.currentStake * (S.recoveryFactor || 1);
+                    if (S.maxRecoveryStake > 0) next = Math.min(next, S.maxRecoveryStake);
+                    S.currentStake = +next.toFixed(2);
+                    botRebuildBuyPayloadCache();
+                    botAddLog('Martingale (dual) → next stake $' + S.currentStake.toFixed(2));
+                } else {
+                    S.recoveryActive = false;
+                    S.currentStake = S.initStake;
+                    botRebuildBuyPayloadCache();
+                }
+                if (!botCheckRisk()) return;
+                if (S.botActive) {
+                    var delay = S.turboMode ? 30 : 200;
+                    setTimeout(function() {
+                        if (S.botActive && !S.activeContractId && !(S.activeDualIds && S.activeDualIds.size)) {
+                            if (S.directEntry || S.initialEntryMet) botExecuteTrade();
+                        }
+                    }, delay);
+                }
+            }
+            return;
+        }
+
+        if (!S.activeContractId) return;
+        if (String(poc.contract_id) !== String(S.activeContractId)) return;
+        if (poc.id) S.contractSubId = poc.id;
         if (S.contractSubId && S.ws && S.ws.readyState === 1) {
             try { S.ws.send(JSON.stringify({ forget: S.contractSubId })); } catch (e) {}
             S.contractSubId = null;
@@ -8959,9 +9282,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             if (S.maxRecoveryStake > 0) nextStake = Math.min(nextStake, S.maxRecoveryStake);
             S.currentStake = nextStake;
             S.recoveryActive = true;
+            botRebuildBuyPayloadCache();
             botAddLog('Martingale — next stake: $' + nextStake.toFixed(2) + ' (×' + S.recoveryFactor + ')');
         } else { S.currentStake = S.secondStake;
-            S.recoveryActive = false; }
+            S.recoveryActive = false;
+            botRebuildBuyPayloadCache(); }
         S.activeContractId = null;
         S.contractPurchasePrice = null;
         S.tradeStartTickIndex = null;
@@ -8972,14 +9297,21 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             return;
         }
         setTimeout(function() { if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ balance: 1 })); }, 500);
-        if (S.botActive && S.initialEntryMet && botCheckRisk()) botExecuteTrade();
+        if (S.botActive && S.initialEntryMet && botCheckRisk()) {
+            /* Turbo: re-arm almost immediately; non-turbo keeps a small breathing room */
+            if (S.turboMode) {
+                queueMicrotask(function() { if (S.botActive && !S.activeContractId && !S.isPlacingTrade) botExecuteTrade(); });
+            } else {
+                setTimeout(function() { if (S.botActive && !S.activeContractId && !S.isPlacingTrade) botExecuteTrade(); }, 150);
+            }
+        }
     }
 
     function botProcessTick() {
         if (!S.lastTick || !S.tradingConfig) return;
         var digit = S.lastTick.digit;
         var isRF = S.tradingConfig.contractType === 'RISE_FALL';
-        if (!S.activeContractId && !S.isPlacingTrade) {
+        if (!S.activeContractId && !(S.activeDualIds && S.activeDualIds.size) && !S.isPlacingTrade) {
             if (!S.initialEntryMet) {
                 if (S.directEntry) {
                     S.initialEntryMet = true;
@@ -9030,13 +9362,15 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                         (_isEvenBot2 ? 'O,O,O,E' : 'E,E,E,O') + '] — last4: ' + _pc.seq;
                 }
             } else { botExecuteTrade(); }
-        } else if (S.activeContractId && S.tradeStartTickIndex !== null) {
+        } else if ((S.activeContractId || (S.activeDualIds && S.activeDualIds.size)) && S.tradeStartTickIndex !== null) {
             var elapsed = S.digits.length - S.tradeStartTickIndex;
             var remaining = Math.max(0, S.tradeDuration - elapsed);
             if (remaining > 0) {
+                var dualNote = (S.activeDualIds && S.activeDualIds.size)
+                    ? ('Dual Over2+Under7 (' + S.activeDualIds.size + ' legs)')
+                    : ('Contract #' + S.activeContractId + ' — ' + S.tradingConfig.contractType);
                 document.getElementById('bot-trade-status').textContent =
-                    'Contract #' + S.activeContractId + ' — ' + S.tradingConfig.contractType + ' — ' + remaining +
-                    ' tick(s) remaining';
+                    dualNote + ' — ' + remaining + ' tick(s) remaining';
             }
         }
     }
@@ -9135,6 +9469,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         S.botChartData = { labels: [], data: [], cumulative: 0 };
         S.trailingPeak = 0;
         S.activeContractId = null;
+        S.activeDualIds = null;
+        S.dualSettled = null;
+        S.dualCombinedProfit = 0;
         S.contractSubId = null;
         S.initialEntryMet = false;
         S.directEntry = !!S.directEntryNext;   // set only by the Market Scanner auto-execute
@@ -9191,6 +9528,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
             S.contractSubId = null;
         }
         S.activeContractId = null;
+        S.activeDualIds = null;
+        S.dualSettled = null;
+        S.dualCombinedProfit = 0;
         document.getElementById('bot-trade-status').textContent = 'Bot stopped.';
         document.getElementById('b-start').disabled = false;
         document.getElementById('b-stop').disabled = true;
@@ -9707,6 +10047,18 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 exit = entry.slice();
                 winRate = dc.slice(0, 8).reduce(function(a, b) { return a + b; }, 0) / n;
                 break;
+            case 'OVER2_UNDER7': {
+                var over2Rate = nv.slice(3).reduce(function(a, b) { return a + b; }, 0);
+                var under7Rate = nv.slice(0, 7).reduce(function(a, b) { return a + b; }, 0);
+                score = (over2Rate + under7Rate) / 2;
+                barrier = 2;
+                entry = sorted.filter(function(d) { return d > 2 && d < 7; }).slice(0, 3);
+                if (!entry.length) entry = sorted.slice(0, 3);
+                exit = entry.slice();
+                winRate = (dc.slice(3).reduce(function(a, b) { return a + b; }, 0) +
+                    dc.slice(0, 7).reduce(function(a, b) { return a + b; }, 0)) / (2 * n);
+                break;
+            }
             case 'DIGITMATCH':
                 barrier = best;
                 entry = sorted.slice(1, 4);
@@ -9770,6 +10122,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 switch (ct) {
                     case 'DIGITOVER': return d > 1;
                     case 'DIGITUNDER': return d < 8;
+                    case 'OVER2_UNDER7': return (d > 2) || (d < 7);
                     case 'DIGITMATCH': return d === barrier;
                     case 'DIGITDIFF': return d !== barrier;
                     case 'DIGITEVEN': return d % 2 === 0;
@@ -9801,7 +10154,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         'aiscan-sig-w';
         var entD = Array.isArray(r.entry) ? r.entry.join(', ') : String(r.entry);
         var extD = Array.isArray(r.exit) ? r.exit.join(', ') : String(r.exit);
-        var barD = r.barrier !== null ? String(r.barrier) : '—';
+        var barD = r.ct === 'OVER2_UNDER7' ? '2 / 7' : (r.barrier !== null ? String(r.barrier) : '—');
         var confW = Math.round(r.score * 100);
         var confCol = r.score >= 0.72 ? '#10b981' : r.score >= 0.60 ? '#f59e0b' : '#64748b';
         var wrCol = r.winRate >= 0.65 ? '#10b981' : r.winRate >= 0.55 ? '#f59e0b' : '#ef4444';
