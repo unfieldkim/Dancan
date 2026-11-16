@@ -10792,7 +10792,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
                 response_type:         'code',
                 client_id:             appId,
                 redirect_uri:          REGISTERED_REDIRECT_URI,
-                scope:                 'trade account_manage',
+                scope:                 'trade',
                 state:                 state,
                 code_challenge:        codeChallenge,
                 code_challenge_method: 'S256'
@@ -10882,9 +10882,12 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
         if (errEl) { errEl.innerHTML = ''; errEl.textContent = ''; }
 
         if (result.error) {
-            showAuthError('OAuth Login Cancelled',
-                result.error_description || result.error,
-                'token');
+            var desc = result.error_description || result.error || '';
+            try { desc = decodeURIComponent(String(desc).replace(/\+/g, ' ')); } catch (e) {}
+            if (/invalid_scope|account_manage|malformed/i.test(desc)) {
+                desc = desc + ' — On developers.deriv.com → your App → enable only the scopes you request. This app now requests "trade" only.';
+            }
+            showAuthError('OAuth Login Cancelled', desc, 'token');
             return;
         }
 
